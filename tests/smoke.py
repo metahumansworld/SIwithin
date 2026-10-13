@@ -104,7 +104,7 @@ try:
     bud = section(out, "budget", "\0")
     N = siwithin.NAME
     rc, out, err = tool_cli(["--version"])
-    check(rc == 0 and out.strip() == "siwithin 0.2.0", f"--version prints siwithin 0.2.0: {out.strip()!r}")
+    check(rc == 0 and out.strip() == "siwithin 0.2.1", f"--version prints siwithin 0.2.1: {out.strip()!r}")
     check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
     check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
           "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -435,7 +435,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.2.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.2.1" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()

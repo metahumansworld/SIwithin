@@ -99,7 +99,7 @@ After a run ends, and before its ledger line is appended, the runner writes `rec
 
 `receipt.json` is JSON with sorted keys, indent 1, UTF-8; its hash is the sha256 of its bytes. Fields:
 
-- `receipt`: the format's version, 1. `tool`: `siwithin 0.2.0`. `run`: the run folder's name, as on the ledger line after `runs/`.
+- `receipt`: the format's version, 1. `tool`: the runner's name and version, `siwithin 0.2.1`. `run`: the run folder's name, as on the ledger line after `runs/`.
 - `started` and `ended`: the run's start and the moment the receipt was written, ISO 8601 to the second. `status`: as on the ledger line.
 - `files`: the sha256 of `brief.md`, `command.txt`, `fence.sb`, `events.jsonl`, `stderr.txt`, `result.md` and `summary.json`. Nothing else from the folder: not `tmp/`.
 - `ledger_before`: the sha256 of the ledger's bytes immediately before this run's line was appended (with the header already written when the ledger was new).
@@ -153,7 +153,7 @@ Copy `config.example.toml` to `~/.config/siwithin/config.toml`. Every option is 
 
 ## Status
 
-Version 0.2.0, released 14 October 2026: the receipt, live on one run that day, Claude Code 2.1.296 with Haiku, after which `--verify` printed `1 receipts ok, 0 failed, 4 lines without a receipt`; the smoke test passes 168 checks with fake CLIs. Four live runs on Claude Code 2.1.296, on 13 October 2026: the first ended by the model's own end of turn at $0.0995 of a $0.10 budget, the CLI having shown it the budget; the second authenticated through a keychain the run could only read; the third and fourth were stopped by the CLI's budget flag, the first enforcement live, the fourth with the config directory writable in its state paths only; a run past the cap was refused before launch. No write was refused by the fence, and none was seen outside the run folders; what the CLI wrote in the folders the fence allows it, its config directory and the caches, was not listed. Not yet live: the runner's own kill, the second enforcement, exercised only with the fake CLIs.
+Version 0.2.1, released 14 October 2026: a budget under a cent prints with four decimals in the kill status, the over-budget note, the cap check and the dry-run text, where 0.2.0 printed `$0.00`; the runner is otherwise 0.2.0's, and the smoke test passes 168 checks with fake CLIs. Version 0.2.0, released 14 October 2026: the receipt, live on one run that day, Claude Code 2.1.296 with Haiku, after which `--verify` printed `1 receipts ok, 0 failed, 4 lines without a receipt`; the smoke test passes 168 checks with fake CLIs. Four live runs on Claude Code 2.1.296, on 13 October 2026: the first ended by the model's own end of turn at $0.0995 of a $0.10 budget, the CLI having shown it the budget; the second authenticated through a keychain the run could only read; the third and fourth were stopped by the CLI's budget flag, the first enforcement live, the fourth with the config directory writable in its state paths only; a run past the cap was refused before launch. No write was refused by the fence, and none was seen outside the run folders; what the CLI wrote in the folders the fence allows it, its config directory and the caches, was not listed. Not yet live: the runner's own kill, the second enforcement, exercised only with the fake CLIs.
 
 ## Tests
 

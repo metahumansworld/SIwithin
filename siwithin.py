@@ -38,7 +38,7 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 UNCONFIRMED = "unconfirmed"  # an adapter field holding this is a stub: any option that needs it is refused, naming the field
 ROADMAP = "README.md, 'What v0.1 does not do'"
@@ -407,6 +407,11 @@ def num(x):
     return f"{x:.4f}".rstrip("0").rstrip(".") if x else "0"
 
 
+def money(x):
+    """A dollar figure: two decimals when it is exact there, four when it is not, so a budget under a cent does not print as $0.00."""
+    return f"${x:.2f}" if abs(x - round(x, 2)) < 5e-7 else f"${x:.4f}"
+
+
 # ---- the receipt: what a run's folder and the ledger held when the run ended, as hashes ------------------------------------------
 
 RECEIPT_FILES = ("brief.md", "command.txt", "fence.sb", "events.jsonl", "stderr.txt", "result.md", "summary.json")
@@ -697,8 +702,8 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
         with open(P.cap_path, encoding="utf-8") as f: P.cap = float(f.read().strip())
     except (OSError, ValueError) as x: P.cap = None; chk("refuse", f"no readable cap in {P.cap_path} ({x}); write the dollars all runs together may spend, e.g.  echo 20 > {P.cap_path}")
     if P.cap is not None:
-        if P.total + P.budget > P.cap: chk("refuse", f"ledger true total ${P.total:.2f} + budget ${P.budget:.2f} passes the cap ${P.cap:.2f} in {P.cap_path}")
-        else: chk("ok", f"cap: ledger true total ${P.total:.2f} + budget ${P.budget:.2f} is within the cap ${P.cap:.2f}")
+        if P.total + P.budget > P.cap: chk("refuse", f"ledger true total ${P.total:.2f} + budget {money(P.budget)} passes the cap ${P.cap:.2f} in {P.cap_path}")
+        else: chk("ok", f"cap: ledger true total ${P.total:.2f} + budget {money(P.budget)} is within the cap ${P.cap:.2f}")
 
     # environment, config dir, CLI
     P.siwithin_home, P.home = siwithin_home, home
@@ -772,26 +777,26 @@ def show_plan(P):
     pr("== config checks ==")
     for lv, t in P.checks: pr(f"{lv:<6} {t}")
     pr("\n== budget ==")
-    pr(f"budget this run: ${P.budget:.2f} true dollars, at the [prices] rates read on {P.prices_read_on}")
+    pr(f"budget this run: {money(P.budget)} true dollars, at the [prices] rates read on {P.prices_read_on}")
     if P.model: pr(f"model: {P.model}, rates per million tokens (input, cache write, cache read, output): {P.rates or 'none listed'}")
     if P.mode == "flag":
         flag = f"{P.ad['budget_flag']} {num(round(P.cli_budget, 4))} (factor {P.factor} between the CLI's units and true dollars)"
         if P.also_stream:
             pr(f"enforced twice:\n  1. by the CLI: {flag}; {NAME} reads the true cost at the end")
             pr(f"  2. by {NAME}, from the stream: each assistant event's usage is priced at the [prices] rates, once per message id, and the run's process group is killed when the true cost "
-               f"reaches ${P.budget:.2f}: \"killed: budget ${P.budget:.2f} reached at $<true> true\"")
+               f"reaches {money(P.budget)}: \"killed: budget {money(P.budget)} reached at $<true> true\"")
             pr("     the stream's output tokens are a placeholder until the result event, so this figure is a lower bound and the stop can come after the budget on a run heavy in output")
             if P.model and not P.rates: pr(f"     no price for {P.model} in [prices]: this stop cannot count it, and only the CLI's flag stops the run")
             if not P.model: pr("     no --model: a model the stream reports with no price in [prices] is not counted, and only the CLI's flag stops the run")
             pr("     if the stream carries no usage, the CLI's flag alone enforces the budget and the summary notes say so")
         else: pr(f"enforced by the CLI: {flag}; {NAME} reads the true cost at the end")
-    elif P.mode == "stream": pr(f"enforced by {NAME}: usage is read as it streams and the run is killed when it reaches ${P.budget:.2f}")
-    else: pr(f"checked by {NAME} when each turn ends (--soft-budget): the run is killed between turns once usage reaches ${P.budget:.2f}; one long turn can pass it unseen")
+    elif P.mode == "stream": pr(f"enforced by {NAME}: usage is read as it streams and the run is killed when it reaches {money(P.budget)}")
+    else: pr(f"checked by {NAME} when each turn ends (--soft-budget): the run is killed between turns once usage reaches {money(P.budget)}; one long turn can pass it unseen")
     pr(f"time: killed after {P.timeout}s by a timer, always")
     if P.cap is None: pr(f"cap: unreadable ({P.cap_path})")
     else:
         after = P.total + P.budget
-        pr(f"ledger: ${P.total:.2f} true over {P.nruns} runs ({P.ledger_path})\ncap: ${P.cap:.2f}\nworst case after this run: ${P.total:.2f} + ${P.budget:.2f} = ${after:.2f} of ${P.cap:.2f}, "
+        pr(f"ledger: ${P.total:.2f} true over {P.nruns} runs ({P.ledger_path})\ncap: ${P.cap:.2f}\nworst case after this run: ${P.total:.2f} + {money(P.budget)} = ${after:.2f} of ${P.cap:.2f}, "
            + (f"within the cap, ${P.cap - after:.2f} left" if after <= P.cap else f"over the cap by ${after - P.cap:.2f}: REFUSED"))
 
 
@@ -885,13 +890,13 @@ def execute(P, cfg):
                 if P.mode in ("stream", "turn"):  # the CLI has no budget flag: the budget is kept here, from the usage it streams
                     running = true_total(st["usage"], st["cli_costs"], cfg["prices"], cfg["factors"])[0]
                     if running >= P.budget:
-                        reason = f"killed: budget ${P.budget:.2f} reached at ${running:.4f} true"
+                        reason = f"killed: budget {money(P.budget)} reached at ${running:.4f} true"
                         if P.mode == "stream" or e.get("type") == "turn.started": stop("budget", reason); break
                         # usage arrives when a turn ends: a run that ends with its turn is left to exit and is reported over budget, one that starts another turn is killed
                         if grace is None: grace = threading.Timer(5, lambda: stop("budget", reason)); grace.daemon = True; grace.start()
                 elif P.also_stream and e.get("type") == "assistant":  # the CLI's flag stops at budget x factor; this stops at the true budget, whatever the factor says
                     running = true_total(st["usage"], st["cli_costs"], cfg["prices"], cfg["factors"])[0]
-                    if running >= P.budget: stop("budget", f"killed: budget ${P.budget:.2f} reached at ${running:.4f} true"); break
+                    if running >= P.budget: stop("budget", f"killed: budget {money(P.budget)} reached at ${running:.4f} true"); break
         except KeyboardInterrupt: stop("interrupted", "killed: interrupted")
         finally:
             timer.cancel()
@@ -926,7 +931,7 @@ def execute(P, cfg):
     if st["errors"]: notes.append("CLI errors: " + "; ".join(st["errors"][:3]))
     if st["text_is_last_message"]: notes.append("the CLI's result carried no text: result.md holds the model's last message from the stream")
     if P.mode == "turn": notes.append("budget checked when each turn ends, not while a turn runs (--soft-budget)")
-    if true > P.budget + 1e-9 and not ceiling: notes.append(f"over budget: true ${true:.4f} against budget ${P.budget:.2f}")
+    if true > P.budget + 1e-9 and not ceiling: notes.append(f"over budget: true ${true:.4f} against budget {money(P.budget)}")
     status = "done"
     if killed[0]: status = killed[0][1] if killed[0][1].startswith("killed") else f"killed: {killed[0][1]}"
     elif st["failed"]: status = st["failed"]
