@@ -3,7 +3,7 @@
 ## v0.2.1, 2026-10-14
 
 - 2026-10-14: released, the runner 0.2.0's with the line below; the smoke test passes 168 checks with fake CLIs.
-- 2026-10-14: the budget prints with four decimals where two would show `$0.00`: in the kill status `killed: budget $… reached at $… true`, the over-budget note, the cap check and the `--dry-run` text. A budget of $0.0001 printed as `$0.00` in the red briefs' third live pass that day (TESTS.md, item 10). A budget exact at two decimals prints as before.
+- 2026-10-14: the budget prints with four decimals where two would show `$0.00`: in the kill status `killed: budget $… reached at $… true`, the over-budget note, the cap check and the `--dry-run` text. A budget of $0.0001 printed as `$0.00` in a live run that day. A budget exact at two decimals prints as before.
 
 ## v0.2.0, 2026-10-14
 
