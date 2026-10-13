@@ -1,0 +1,139 @@
+# SIwithin config.example.toml: copy to ~/.config/siwithin/config.toml (or <--home>/config.toml). Everything below is the built-in default, so a file with only
+# the lines you change works: a key you give replaces that key's built-in value, a table you give is merged into the built-in one, and a new adapter name adds an adapter.
+# The reader is Python's tomllib (3.11+) or a built-in reader for the TOML subset used here (3.10): no multi-line strings, no arrays of tables.
+
+[defaults]
+adapter = "claude"   # the adapter used when --adapter is not given
+budget = 5.0         # true dollars one run may spend, when --budget is not given
+turns = 40           # turn limit, for adapters that have a turn flag, when --turns is not given
+timeout = 2700       # seconds before a run is killed by the timer, when --timeout is not given
+
+[never]
+folders = []         # folders no run is given as --dir or --read, on top of the home root, ~/.ssh, ~/.config, ~/Library and each adapter's own_dir
+
+[fence]
+read_home = ["Library/Caches", "Library/Logs", "Library/Keychains", "Library/Python", ".gitconfig", ".config/git"]  # home-relative paths a run may read, on top of its folders
+write_home = ["Library/Caches", "Library/Logs", "Library/Keychains"]  # home-relative paths a run may write, on top of its writable folder
+rc_files = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout", ".bash_profile", ".bash_login", ".bashrc", ".profile"]  # home-relative shell files a run may read; list files these source in read_home
+deny_write = ["/private/tmp", "/tmp", "/opt", "/usr/local", "/Applications", "/Library", "/Volumes"]  # roots outside the home where writes are refused
+deny_exec = ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay"]  # programs a run may not start
+
+[env]
+pass = ["HOME", "PATH", "USER", "TMPDIR", "LANG", "SHELL", "TERM"]  # variables copied into the run's environment by name; nothing else is inherited
+
+# Dollars per million tokens, as [input, cache write, cache read, output], keyed by the model id the CLI reports. Cache writes are priced at the 5-minute rate.
+# Rates above a model's first tier are not here (a Haiku 5.5 prompt over 100,000 tokens, a long-context or fast tier at OpenAI): a run that uses them is understated.
+[prices]
+read_on = "2026-10-13"   # the day these rates were read; a warning appears when they are older than 90 days
+source = "platform.claude.com/docs/en/about-claude/pricing; developers.openai.com/api/docs/pricing"  # where they were read
+web_search = 0.01        # dollars per web search request, added for any model that reports search requests
+"claude-haiku-5-5" = [0.10, 0.125, 0.01, 0.50]
+"claude-sonnet-5-5" = [2.0, 2.5, 0.10, 10.0]
+"claude-opus-5-5" = [4.0, 5.0, 0.20, 20.0]
+"claude-haiku-4-5-20251001" = [1.0, 1.25, 0.10, 5.0]
+"gpt-5.3-codex" = [1.75, 1.75, 0.175, 14.0]   # no cache-write price at OpenAI, so the input rate stands in and is never used
+"gpt-6.1-sol" = [2.0, 2.0, 0.10, 10.0]
+
+# CLI budget units per true dollar, keyed by model id; a model not listed is 1. The budget flag gets budget x factor, and a warning appears when the CLI's own
+# cost over the true cost is more than four times the factor or less than a quarter of it. The streamed stop (usage_at = "message") does not use the factor.
+[factors]
+"claude-haiku-5-5" = 1   # CLI 2.1.284 priced this model at another model's rates and needed 40 here; CLI 2.1.296 prices it truly. On 2.1.284 set 40 in your config.toml
+
+# ---- adapters: how to drive one CLI. Fields set to "unconfirmed" are stubs: an option that needs one is refused, naming the field. ----
+
+[adapters.claude]
+bin = "claude"                                       # the program, looked up on PATH
+own_dir = "~/.claude"                                # the CLI's own config directory in the home: never given to a run as --dir or --read
+config_dir = "{fence_home}/claude-config"            # the config directory the run uses, with no login in it unless you put one there
+config_dir_env = "CLAUDE_CONFIG_DIR"                 # the variable that points the CLI at config_dir
+tmp_env = "CLAUDE_CODE_TMPDIR"                       # the variable that moves the CLI's temp root into the run's folder ("" if it has none)
+read_home = [".local/bin", ".local/share/claude"]    # home-relative paths a run of this CLI may read, besides the folder of its binary
+write_home = []                                      # home-relative paths a run of this CLI may write
+env_pass = ["ANTHROPIC_API_KEY"]                     # variables copied into this CLI's environment by name, on top of [env] pass
+output = "claude-stream-json"                        # how to read the CLI's output: claude-stream-json or codex-jsonl
+usage_at = "message"                                 # when usage reaches the runner: message, turn or end. With a budget flag, message adds a second stop: the runner kills the run at the true budget
+input_includes_cached = false                        # whether the CLI's input token count already includes cached tokens (codex-jsonl only)
+brief = "stdin"                                      # how the brief is passed: stdin or arg
+brief_arg = ""                                       # an argument placed last: the stdin marker, or the flag before the brief when brief is arg
+cwd_flag = ""                                        # a flag that sets the working folder, besides running in it ("" if none)
+model_flag = "--model"                               # the flag that sets the model
+effort_flag = "--effort"                             # the flag that sets reasoning effort
+effort_env = "CLAUDE_CODE_EFFORT_LEVEL"              # a variable that also carries the effort ("" if none)
+turns_flag = "--max-turns"                           # the flag that limits turns ("" if the CLI has none)
+budget_flag = "--max-budget-usd"                     # the flag that limits dollars, given budget x factor ("" if the CLI has none, and the runner keeps the budget from streamed usage)
+add_dir_flag = "--add-dir"                           # the flag that gives the CLI a folder, repeated for the run's folders ("" if none)
+resume_flag = "--resume"                             # the flag that resumes a session
+last_message_flag = ""                               # a flag that writes the final message to a file in the run's folder ("" if none)
+args = ["-p", "--setting-sources", "user,project", "--strict-mcp-config", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]  # fixed arguments; {run}, {dir} and {fence_home} are filled in
+# arguments for a run whose folder is writable: the tools it may use, the shell commands and local git subcommands allowed, the tools that start further runs or push are denied
+args_write = [
+  "--tools", "Read,Grep,Glob,Edit,Write,WebSearch,WebFetch,Bash",
+  "--allowedTools", "Read", "Grep", "Glob", "Edit", "Write", "WebSearch", "WebFetch",
+  "Bash(ls:*)", "Bash(mkdir:*)", "Bash(cp:*)", "Bash(cat:*)", "Bash(date:*)", "Bash(pwd:*)", "Bash(echo:*)", "Bash(printf:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)",
+  "Bash(find:*)", "Bash(test:*)", "Bash(touch:*)", "Bash(python3:*)", "Bash(grep:*)", "Bash(sort:*)", "Bash(cut:*)", "Bash(du:*)", "Bash(stat:*)", "Bash(sed:*)",
+  "Bash(git init:*)", "Bash(git status:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git rev-parse:*)",
+  "Bash(git branch:*)", "Bash(git checkout:*)", "Bash(git switch:*)", "Bash(git restore:*)", "Bash(git stash:*)", "Bash(git mv:*)", "Bash(git rm:*)", "Bash(git ls-files:*)",
+  "Bash(git blame:*)", "Bash(git tag:*)",
+  "--disallowedTools", "Agent", "Skill", "NotebookEdit", "ListAgents", "SendMessage", "Artifact", "Workflow", "AskUserQuestion", "ScheduleWakeup", "SendUserFile", "Monitor",
+  "ToolSearch", "TaskStop", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+  "Bash(git push:*)", "Bash(git pull:*)", "Bash(git fetch:*)", "Bash(git remote:*)", "Bash(git clone:*)", "Bash(git submodule:*)", "Bash(git config:*)",
+]
+# arguments for a --readonly run: no editing tools and no shell
+args_readonly = [
+  "--tools", "Read,Grep,Glob,WebSearch,WebFetch",
+  "--allowedTools", "Read", "Grep", "Glob", "WebSearch", "WebFetch",
+  "--disallowedTools", "Agent", "Skill", "NotebookEdit", "ListAgents", "SendMessage", "Artifact", "Workflow", "AskUserQuestion", "ScheduleWakeup", "SendUserFile", "Monitor",
+  "ToolSearch", "TaskStop", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+  "Bash(git push:*)", "Bash(git pull:*)", "Bash(git fetch:*)", "Bash(git remote:*)", "Bash(git clone:*)", "Bash(git submodule:*)", "Bash(git config:*)",
+]
+extra_args = []                                      # arguments added last; e.g. ["--settings", "/path/to/settings.json"] for a key helper
+version_args = ["--version"]                         # arguments that make the CLI print its version
+auth_status_args = ["auth", "status"]                # arguments that make the CLI print its auth as JSON with authMethod and orgId ([] if it cannot)
+auth_methods_ok = ["api_key", "api_key_helper"]      # authMethod values that mean an API key is billed
+key_sources_ok = ["apiKeyHelper", "ANTHROPIC_API_KEY"]  # values of the init event's key source that mean an API key is billed
+require_api_key = true                               # refuse unless the CLI bills an API key and not a login, when --require-api-key is not given
+measured = ["2.1.284", "2.1.296"]                    # CLI versions the adapter was run on; another version gets a note in the summary
+unconfirmed = []                                     # assumptions about the CLI not confirmed from its documentation, listed in every dry run and summary
+
+[adapters.claude.aliases]
+haiku = "claude-haiku-5-5"      # --model haiku
+sonnet = "claude-sonnet-5-5"    # --model sonnet
+opus = "claude-opus-5-5"        # --model opus
+
+# Codex: built from the documentation read on 2026-10-13 and not run against a live CLI. See README, "The Codex adapter".
+[adapters.codex]
+bin = "codex"                                        # the program, looked up on PATH
+own_dir = "~/.codex"                                 # the CLI's own config directory in the home: never given to a run as --dir or --read
+config_dir = "{fence_home}/codex-config"             # the config directory the run uses, with no login in it unless you put one there
+config_dir_env = "CODEX_HOME"                        # the variable that points the CLI at config_dir
+tmp_env = ""                                         # the CLI has no temp-root variable in the documentation read
+read_home = []                                       # install location unconfirmed: the folder of the binary found on PATH is added at run time
+write_home = []                                      # home-relative paths a run of this CLI may write
+env_pass = ["CODEX_API_KEY"]                         # variables copied into this CLI's environment by name, on top of [env] pass
+output = "codex-jsonl"                               # how to read the CLI's output: claude-stream-json or codex-jsonl
+usage_at = "turn"                                    # usage appears only on turn.completed, so the budget is checked when a turn ends
+input_includes_cached = true                         # unconfirmed: the docs do not say whether input_tokens includes cached_input_tokens; the sample numbers suggest it
+brief = "stdin"                                      # how the brief is passed: stdin or arg
+brief_arg = "-"                                      # "-" makes the CLI read the prompt from stdin
+cwd_flag = "--cd"                                    # sets the workspace root before the task runs
+model_flag = "--model"                               # the flag that sets the model
+effort_flag = "unconfirmed"                          # no effort flag was found in the documentation read
+effort_env = ""                                      # no variable carries the effort
+turns_flag = ""                                      # the documentation lists no turn limit
+budget_flag = ""                                     # the documentation lists no spending limit, so the runner keeps the budget from streamed usage
+add_dir_flag = ""                                    # left empty on purpose: the CLI's --add-dir grants write access, which --read must not
+resume_flag = "unconfirmed"                          # the CLI resumes with the subcommand `exec resume`, which is not wired in v0.1
+last_message_flag = "--output-last-message"          # writes the final message to a file in the run's folder
+args = ["exec", "--json", "--skip-git-repo-check"]   # fixed arguments: non-interactive mode, JSON Lines on stdout, no git repository required
+args_write = ["--sandbox", "workspace-write"]        # arguments for a run whose folder is writable
+args_readonly = ["--sandbox", "read-only"]           # arguments for a --readonly run
+extra_args = []                                      # arguments added last
+version_args = ["--version"]                         # arguments that make the CLI print its version
+auth_status_args = []                                # no auth status command was found in the documentation read
+auth_methods_ok = []                                 # not used without an auth status command
+key_sources_ok = []                                  # the CLI's events name no key source in the documentation read
+require_api_key = false                              # not checkable for this adapter; --require-api-key is refused for it
+measured = []                                        # never run against a live CLI by the author
+unconfirmed = ["input_includes_cached", "output_includes_reasoning", "usage_is_per_turn", "sandbox_runs_inside_fence", "install_location", "version_output"]  # see README
+
+[adapters.codex.aliases]
