@@ -53,6 +53,7 @@ The profile is generated per run, from a template, with the home folder derived 
 Report a fence bypass, a way for a run to exceed its budget or the cap, a way to get the tool to read or print a key, a false entry in the ledger, or a receipt or chain that still verifies after a change **privately**, not in a public issue.
 
 - Write to **siwithin@metahumans.world**.
+- Or use the repository's private vulnerability reporting on GitHub (the Security tab, "Report a vulnerability").
 - Include the macOS version, the output of `siwithin.py --version`, the `fence.sb` and `command.txt` from the run folder (remove anything private), the run's `receipt.json` if there is one, and the steps to reproduce.
 
 No response time is promised yet. Reports are welcome, and a fix will be credited if the reporter wants it.
