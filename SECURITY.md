@@ -10,7 +10,7 @@ What the tool protects, in order:
 
 1. The user's files outside the folders a run was given (keys, tokens, shell history, other projects, browser profiles, the tool's own ledger and the briefs of other runs).
 2. The user's money: what a run, and all runs together, can spend.
-3. The truth of the record: the ledger and each run's summary.
+3. The truth of the record: the ledger, each run's summary and, from 0.2.0, each run's receipt, a manifest of the hashes of the files the run wrote, chained through the ledger and checked by `--verify` (the README's receipt section says what it proves and what it does not).
 
 What it does not protect against: a malicious CLI binary, a malicious `config.toml`, a hostile local user, or an attacker who already controls the account running the tool.
 
@@ -44,16 +44,15 @@ The profile is generated per run, from a template, with the home folder derived 
 
 ## Not verified in this release
 
-- The profile was built from constructs the launcher it grew from already used, but it was not compiled by `sandbox-exec` while building v0.1. Run `python3 siwithin.py --dir <a scratch folder> --dry-run < /dev/null`, then a real run of a trivial brief, and read `stderr.txt` before you rely on it.
+- The profile was built from constructs the launcher it grew from already used. It compiled and ran live on 13 October 2026, four runs on Claude Code 2.1.296, and once more on 14 October for the receipt (README, Status): the fence refused no write in them, and what the CLI wrote in the paths the fence allows it, its config directory and the caches, was not listed. The runner's own budget kill, the second enforcement, has run only against the fake CLIs. Run `python3 siwithin.py --dir <a scratch folder> --dry-run < /dev/null`, then a real run of a trivial brief, and read `stderr.txt` before you rely on it.
 - The second built-in adapter was built from documentation and not run against a live CLI (see the README).
-- `tests/smoke.py` drives whole runs against fake CLIs with the sandbox program replaced by a shim: it tests what the tool does around the CLI, not the fence.
+- `tests/smoke.py` drives whole runs against fake CLIs with the sandbox program replaced by a shim: it tests what the tool does around the CLI, the receipt included, not the fence.
 
 ## Reporting a problem
 
-Report a fence bypass, a way for a run to exceed its budget or the cap, a way to get the tool to read or print a key, or a false entry in the ledger **privately**, not in a public issue.
+Report a fence bypass, a way for a run to exceed its budget or the cap, a way to get the tool to read or print a key, a false entry in the ledger, or a receipt or chain that still verifies after a change **privately**, not in a public issue.
 
-- Use the private vulnerability reporting of the repository that hosts this project (the Security tab, "Report a vulnerability"), once the project is hosted.
-- Include the macOS version, the output of `siwithin.py --version`, the `fence.sb` and `command.txt` from the run folder (remove anything private), and the steps to reproduce.
-- Or write to **people@metahumans.world**.
+- Write to **siwithin@metahumans.world**.
+- Include the macOS version, the output of `siwithin.py --version`, the `fence.sb` and `command.txt` from the run folder (remove anything private), the run's `receipt.json` if there is one, and the steps to reproduce.
 
-No response time is promised in v0.1. Reports are welcome, and a fix will be credited if the reporter wants it.
+No response time is promised yet. Reports are welcome, and a fix will be credited if the reporter wants it.

@@ -64,7 +64,8 @@ SIwithin never reads, parses, stores, prints or logs a key. It copies the enviro
 SIwithin generates a macOS `sandbox-exec` profile for each run, from a template, with the home folder derived at run time. `--dry-run` prints it; each run folder keeps it as `fence.sb`.
 
 - The whole home is refused for reads and writes.
-- Allowed back: the run's folders (readable; the first writable unless `--readonly`), the CLI's binary, its caches, logs and keychain files under `~/Library`, Python user packages, the shell's rc files, git's config, and the run's own config directory.
+- Allowed back: the run's folders (readable; the first writable unless `--readonly`), the CLI's binary, its caches and logs under `~/Library` (readable and writable), its keychain files (readable only, for a key helper), Python user packages, the shell's rc files, git's config, and the run's own config directory.
+- Inside the CLI's config directory, only its state paths are writable (`config_write` in the config): transcripts, sessions, file history, todos, caches and the like. Settings, the state file, memory, commands, skills, agents, hooks, plugins, scheduled tasks and a key helper kept there stay as the owner left them, and the memory folder under each transcript folder stays unwritable too, so a run leaves no instruction for the next one.
 - Writes are also refused in `/private/tmp`, `/tmp`, `/opt`, `/usr/local`, `/Applications`, `/Library` and `/Volumes`. The CLI's temp root is moved into the run's folder, for a CLI that has a variable for it.
 - `open`, `screencapture`, `osascript`, `say` and `afplay` may not be started.
 - SIwithin's own home (config, cap, ledger, other runs' briefs) is refused to the run.
@@ -78,19 +79,44 @@ SIwithin generates a macOS `sandbox-exec` profile for each run, from a template,
 Each run appends one line to `ledger.md` in SIwithin's home and writes a summary line to your terminal:
 
 ```
-2026-10-13 14:02 | docs-pass | /Users/you/work/proj | claude sonnet - | 12 turns | 6.4 min | cli $0.4123 | true $0.4123 | in 310k out 18k | runs/2026-10-13-1402-docs-pass | done
+2026-10-13 14:02 | docs-pass | /Users/you/work/proj | claude sonnet - | 12 turns | 6.4 min | cli $0.4123 | true $0.4123 | in 310k out 18k | runs/2026-10-13-1402-docs-pass | done | receipt 864410d4e9f126c9abf1b0b12c28e21ff8541cf24ceaf98039781609a9133881
 ```
 
 - **cli** is the CLI's own cost figure (`-` when the CLI gives none). **true** is the cost at published rates from `[prices]` in `config.toml`, keyed by model id. `[prices]` carries the date the rates were read (`read_on`) and where (`source`); SIwithin warns when they are over 90 days old. Rates change: check them. Cache writes are priced at the 5-minute rate, and a run that uses a higher tier than the one listed (a long prompt on one model, a long-context or fast tier on another) is understated.
 - **Cap.** `cap` holds one number, the dollars all runs together may spend. SIwithin adds up the **true** column and refuses a run when the total plus its `--budget` passes the cap, checked under the lock.
 - **Budget.** `--budget` is true dollars. For a CLI with a budget flag, SIwithin passes `budget × factor` (`[factors]` is the ratio between the CLI's units and true dollars, 1 unless listed). The built-in default for the smallest Claude model is 1; CLI 2.1.284 priced it at another model's rates and needed 40, which you can set under `[factors]` in `config.toml` if you are on that version. SIwithin warns when the CLI's cost over the true cost is more than four times the factor or less than a quarter of it: the factor has gone stale, in either direction. For a CLI with no budget flag, SIwithin reads usage as it streams and kills the run at the budget. For a CLI that reports usage only when a turn ends, SIwithin refuses unless `--soft-budget` is given, and then the budget is checked when each turn ends.
-- **Claude Code: the budget is enforced twice.** By the CLI's flag (`--max-budget-usd`, given `budget × factor`), and by SIwithin from the stream: each assistant event carries that response's usage, SIwithin prices it at the `[prices]` rates (each message id once; one response can arrive as several events), and kills the run's whole process group when the true cost reaches the budget. The ledger line and the summary then say `killed: budget $0.50 reached at $0.5502 true`. The flag stays as the second stop, so a wrong factor cannot lift the budget by itself. `--dry-run` prints both. Two limits, both in the summary notes when they apply:
+- **Claude Code: the budget is enforced twice.** By the CLI's flag (`--max-budget-usd`, given `budget × factor`), and by SIwithin from the stream: each assistant event carries that response's usage, SIwithin prices it at the `[prices]` rates (each message id once; one response can arrive as several events), and kills the run's whole process group when the true cost reaches the budget. The ledger line and the summary then say `killed: budget $0.50 reached at $0.5502 true`. The flag stays as the second stop, so a wrong factor cannot lift the budget by itself. When the flag stops the run first, the line says `stopped by the CLI's budget flag: Reached maximum budget ($0.10)`, the CLI's own words, and `result.md` holds the model's last message, since the CLI's result then carries no text. `--dry-run` prints both. Two limits, both in the summary notes when they apply:
   - The stream's per-event output tokens are a placeholder until the final result. SIwithin's stop counts input and cache tokens fully and output tokens only as streamed, so it never fires early, and on a run heavy in output it fires after the true budget is passed, by the output not yet reported. A run it kills is booked at what streamed, which is understated by that output; a run that finishes is booked at the CLI's final usage.
   - A model with no entry in `[prices]` cannot be priced from the stream. Its cost in the ledger is the CLI's own figure over its factor, the streamed stop does not count it, and the stop is approximate: only the CLI's flag at `budget × factor` limits it. Add its rates to `[prices]` (and a factor if the CLI's units differ).
 
   If the stream carries no usage fields, SIwithin falls back to the flag alone and the notes say so.
 - **A killed run with no usage report** (timer, interrupt) is booked at its budget as a ceiling, and its line says `(ceiling, usage unreported)`, so the cap stays true.
-- Every run also has a folder under `runs/` with `brief.md`, `command.txt` (the command, environment variable names and the CLI's version), `fence.sb`, `events.jsonl`, `stderr.txt`, `result.md` and `summary.json`.
+- Every run also has a folder under `runs/` with `brief.md`, `command.txt` (the command, environment variable names and the CLI's version), `fence.sb`, `events.jsonl`, `stderr.txt`, `result.md`, `summary.json` and `receipt.json` (see "The receipt").
+
+## The receipt
+
+After a run ends, and before its ledger line is appended, the runner writes `receipt.json` into the run's folder: the sha256 of each file the runner wrote, chained to the previous receipt and to the ledger as it stood. The ledger line then carries the receipt's own hash as its last field, `| receipt <64 hex>`; the terminal prints it on a line `receipt: <64 hex>` after `session:`. The runner writes it after the CLI has exited; the model never does. A run refused before launch writes no receipt and no ledger line, and `--dry-run` writes nothing. `summary.json` cannot carry the receipt's hash, because the receipt hashes `summary.json`.
+
+`receipt.json` is JSON with sorted keys, indent 1, UTF-8; its hash is the sha256 of its bytes. Fields:
+
+- `receipt`: the format's version, 1. `tool`: `siwithin 0.2.0`. `run`: the run folder's name, as on the ledger line after `runs/`.
+- `started` and `ended`: the run's start and the moment the receipt was written, ISO 8601 to the second. `status`: as on the ledger line.
+- `files`: the sha256 of `brief.md`, `command.txt`, `fence.sb`, `events.jsonl`, `stderr.txt`, `result.md` and `summary.json`. Nothing else from the folder: not `tmp/`.
+- `ledger_before`: the sha256 of the ledger's bytes immediately before this run's line was appended (with the header already written when the ledger was new).
+- `previous`: the receipt hash on the last ledger line that carries one, or `null`.
+
+Verify:
+
+```
+python3 siwithin.py --verify [--home H]            # every receipt on the ledger
+python3 siwithin.py --verify ~/.config/siwithin/runs/<run>    # one run folder's files against its receipt
+```
+
+For each ledger line that ends in a receipt, the verifier checks that `receipt.json` exists and hashes to the hex on the line; that each file in `files` hashes as the receipt says; that `ledger_before` is the hash of the ledger's bytes before that line; and that `previous` is the hex on the previous receipt-bearing line (`null` for the first). Because the receipt cannot hold the line it is carried on, it also checks that the line's run and status are the receipt's and that its `true $` figure is the one in `summary.json`, which the receipt does hold. A line without the field, from before 0.2, is counted and not failed. It prints `ok <run>` or `FAIL <run>: <what failed>` per receipt and `N receipts ok, M failed, K lines without a receipt`, and exits 0 only when none failed. It takes no lock and reads no config. With a run folder it checks that folder's files and nothing else, and says `ok <run>: 7 files match the receipt` or `FAIL ...`.
+
+**What it proves:** the run's files and the ledger are as the runner wrote them. A later edit to a brief, a result, an events file or a cost breaks a hash, and an edit to a ledger line breaks the next line's `ledger_before`.
+
+**What it does not prove:** that the events are true to what the API did; the CLI wrote them, and the receipt hashes what the CLI said. And whoever can write SIwithin's home can rewrite every receipt and the whole chain from the first line, so the chain is evidence against change by anything without that access, not against the owner. Keep the last receipt's hash somewhere else, in a message, a note or a commit, and it pins the whole chain at that point: any change before it shows as a different chain.
 
 ## The brief contract
 
@@ -127,7 +153,7 @@ Copy `config.example.toml` to `~/.config/siwithin/config.toml`. Every option is 
 
 ## Status
 
-Version 0.1.2. The smoke test passes 140 checks with fake CLIs. It is not yet verified against a live CLI.
+Version 0.2.0, released 14 October 2026: the receipt, live on one run that day, Claude Code 2.1.296 with Haiku, after which `--verify` printed `1 receipts ok, 0 failed, 4 lines without a receipt`; the smoke test passes 168 checks with fake CLIs. Four live runs on Claude Code 2.1.296, on 13 October 2026: the first ended by the model's own end of turn at $0.0995 of a $0.10 budget, the CLI having shown it the budget; the second authenticated through a keychain the run could only read; the third and fourth were stopped by the CLI's budget flag, the first enforcement live, the fourth with the config directory writable in its state paths only; a run past the cap was refused before launch. No write was refused by the fence, and none was seen outside the run folders; what the CLI wrote in the folders the fence allows it, its config directory and the caches, was not listed. Not yet live: the runner's own kill, the second enforcement, exercised only with the fake CLIs.
 
 ## Tests
 
@@ -135,7 +161,7 @@ Version 0.1.2. The smoke test passes 140 checks with fake CLIs. It is not yet ve
 python3 tests/smoke.py
 ```
 
-Runs with a temporary home and no CLI installed: dry runs for each adapter, the fence profile's lines, forbidden folders, the cap arithmetic, the config reader, and (on macOS) whole runs against fake CLIs with the sandbox program replaced by a shim, so the streaming, kill, ledger and summary code is exercised, including a fake that streams usage past a budget (the run, its child process and its ledger line must be killed for it) and one that stays under. The fence itself is not tested there.
+Runs with a temporary home and no CLI installed: dry runs for each adapter, the fence profile's lines, forbidden folders, the cap arithmetic, the config reader, and (on macOS) whole runs against fake CLIs with the sandbox program replaced by a shim, so the streaming, kill, ledger and summary code is exercised, including a fake that streams usage past a budget (the run, its child process and its ledger line must be killed for it) and one that stays under, and the receipts: written for each booked run and not for a refused one, chained, and `--verify` passing on the home and failing on a changed result, a changed cost, a replaced hash and a changed run folder. The fence itself is not tested there.
 
 ## Renaming
 

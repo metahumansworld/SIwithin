@@ -6,8 +6,11 @@ Usage: python3 siwithin.py --dir <folder> [--adapter claude|codex] [--model M] [
        [--read <folder>]... [--readonly] [--name <slug>] [--out <file, inside --dir>] [--resume <session id>]
        [--done "<text>"] [--absent "<text>"] [--soft-budget] [--require-api-key | --no-require-api-key]
        [--home <folder>] [--dry-run] < brief
+       siwithin.py --verify [<run folder>] [--home <folder>]
 The brief comes on stdin. The tool's home (default ~/.config/siwithin) holds config.toml, cap, ledger.md, lock and runs/; each run's folder under
-runs/ gets the brief, the command, the fence profile, the CLI's events and stderr, result.md and summary.json. macOS only in v0.1.
+runs/ gets the brief, the command, the fence profile, the CLI's events and stderr, result.md, summary.json and receipt.json. macOS only in v0.1.
+The receipt, written by the runner after the CLI has exited, holds the sha256 of each file the runner wrote, the hash of the ledger as it stood and the previous
+receipt's hash; the ledger line carries the receipt's own hash, and --verify checks the files and the chain against it.
 
 Findings from the launcher this grew out of, each made on a real CLI and kept because they explain a choice below:
 - Billing: with a login present in the CLI's config directory, the CLI signs with the login although its init event names an API key source.
@@ -28,14 +31,14 @@ Findings from the launcher this grew out of, each made on a real CLI and kept be
 """
 from __future__ import annotations
 
-import argparse, copy, datetime, json, os, re, shlex, shutil, signal, subprocess, sys, threading
+import argparse, copy, datetime, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, threading
 from types import SimpleNamespace
 
 try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 UNCONFIRMED = "unconfirmed"  # an adapter field holding this is a stub: any option that needs it is refused, naming the field
 ROADMAP = "README.md, 'What v0.1 does not do'"
@@ -61,7 +64,8 @@ DEFAULT_CONFIG = {
     "never": {"folders": []},
     "fence": {
         "read_home": ["Library/Caches", "Library/Logs", "Library/Keychains", "Library/Python", ".gitconfig", ".config/git"],
-        "write_home": ["Library/Caches", "Library/Logs", "Library/Keychains"],
+        "write_home": ["Library/Caches", "Library/Logs"],
+        "config_write": ["projects", "sessions", "session-env", "shell-snapshots", "file-history", "todos", "tasks", "debug", "statsig", "telemetry", "cache", "state", "logs", "paste-cache", "history.jsonl", ".last-cleanup"],
         "rc_files": [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout", ".bash_profile", ".bash_login", ".bashrc", ".profile"],
         "deny_write": ["/private/tmp", "/tmp", "/opt", "/usr/local", "/Applications", "/Library", "/Volumes"],
         "deny_exec": ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay"],
@@ -267,7 +271,7 @@ def load_config(siwithin_home):
 
 def new_state(model):
     return {"model": model, "text": "", "key_source": None, "init": False, "session": None, "turns": None, "usage": {}, "cli_costs": {}, "cli_total": None,
-            "denials": [], "failed": None, "complete": False, "open_turns": 0, "closed_turns": 0, "last_message": None, "errors": [],
+            "denials": [], "failed": None, "complete": False, "open_turns": 0, "closed_turns": 0, "last_message": None, "text_is_last_message": False, "errors": [],
             "msgs": {}, "last_msg": None, "assistant_events": 0, "usage_events": 0}
 
 
@@ -307,9 +311,14 @@ def feed_claude(st, e, ad):
     t = e.get("type")
     if t == "system" and e.get("subtype") == "init":
         st["init"], st["key_source"], st["session"] = True, e.get("apiKeySource"), e.get("session_id")
-    elif t == "assistant" and not st["complete"]: feed_message_usage(st, e.get("message"))
+    elif t == "assistant" and not st["complete"]:
+        feed_message_usage(st, e.get("message"))
+        for c in ((e.get("message") or {}).get("content") or []):  # the model's last words: result.md, when the CLI's result carries no text
+            if isinstance(c, dict) and c.get("type") == "text" and c.get("text"): st["last_message"] = c["text"]
     elif t == "result":
-        st["complete"], st["text"], st["turns"] = True, e.get("result") or "", e.get("num_turns")
+        st["complete"], st["turns"] = True, e.get("num_turns")
+        st["text"] = e.get("result") or ""
+        if not st["text"] and st["last_message"]: st["text"], st["text_is_last_message"] = st["last_message"], True
         st["session"] = st["session"] or e.get("session_id")
         st["usage"] = {}
         for m, u in (e.get("modelUsage") or {}).items():
@@ -318,8 +327,11 @@ def feed_claude(st, e, ad):
             st["cli_costs"][m] = u.get("costUSD")
         st["cli_total"] = e.get("total_cost_usd")
         st["denials"] = [(x.get("tool_name"), json.dumps(x.get("tool_input"))[:160]) for x in (e.get("permission_denials") or [])]
-        if e.get("is_error") or e.get("terminal_reason") == "api_error": st["failed"] = f"api error {e.get('api_error_status')}: {(e.get('result') or '')[:80]}"
-        elif e.get("subtype") != "success": st["failed"] = f"result {e.get('subtype')}"
+        # the CLI's own stops are named in its words: the budget flag (error_max_budget_usd), max turns and the rest; "api error" is kept for the API's own failures
+        sub, errs = e.get("subtype"), "; ".join(str(x) for x in (e.get("errors") or []) if x)[:120]
+        if e.get("terminal_reason") == "api_error" or e.get("api_error_status") is not None: st["failed"] = f"api error {e.get('api_error_status') or '-'}: {errs or (e.get('result') or '')[:80]}"
+        elif sub == "error_max_budget_usd": st["failed"] = f"stopped by the CLI's budget flag: {errs or sub}"
+        elif sub != "success" or e.get("is_error"): st["failed"] = f"stopped by the CLI, {sub}: {errs or (e.get('result') or '')[:80]}"
 
 
 def feed_codex(st, e, ad):
@@ -395,6 +407,95 @@ def num(x):
     return f"{x:.4f}".rstrip("0").rstrip(".") if x else "0"
 
 
+# ---- the receipt: what a run's folder and the ledger held when the run ended, as hashes ------------------------------------------
+
+RECEIPT_FILES = ("brief.md", "command.txt", "fence.sb", "events.jsonl", "stderr.txt", "result.md", "summary.json")
+RECEIPT_TAIL = re.compile(r" \| receipt ([0-9a-f]{64})$")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
+    return h.hexdigest()
+
+
+def receipt_bytes(receipt):
+    return (json.dumps(receipt, sort_keys=True, indent=1, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def read_receipt(folder):
+    """(receipt, sha256 of its bytes, problem): the problem is None when the file is there and is a JSON object."""
+    try:
+        with open(os.path.join(folder, "receipt.json"), "rb") as f: raw = f.read()
+    except OSError: return None, None, "receipt.json is missing"
+    sha = hashlib.sha256(raw).hexdigest()
+    try: rec = json.loads(raw.decode("utf-8"))
+    except ValueError: return None, sha, "receipt.json is not valid JSON"
+    return (rec, sha, None) if isinstance(rec, dict) else (None, sha, "receipt.json is not a JSON object")
+
+
+def check_receipt_files(folder, rec):
+    files = rec.get("files")
+    if not isinstance(files, dict) or sorted(files) != sorted(RECEIPT_FILES): return [f"files does not list exactly {', '.join(RECEIPT_FILES)}"]
+    bad = []
+    for n in RECEIPT_FILES:
+        try: same = sha256_file(os.path.join(folder, n)) == files[n]
+        except OSError: bad.append(f"{n} is missing"); continue
+        if not same: bad.append(f"{n} differs from the receipt")
+    return bad
+
+
+def verify_ledger(home):
+    path = os.path.join(home, "ledger.md")
+    try:
+        with open(path, "rb") as f: data = f.read()
+    except OSError:
+        print(f"no ledger at {path}"); return 1
+    ok = failed = bare = 0
+    prev, h = None, hashlib.sha256()
+    for i, raw in enumerate(data.split(b"\n"), 1):
+        line, before = raw.decode("utf-8", "replace"), h.hexdigest()  # before: the ledger's bytes up to this line
+        h.update(raw + b"\n")
+        if not re.match(r"\d{4}-\d\d-\d\d ", line): continue
+        m = RECEIPT_TAIL.search(line)
+        if not m: bare += 1; continue  # a line from before receipts: counted, not failed
+        hexv, parts = m.group(1), line[:m.start()].split(" | ")
+        name = parts[-2][5:] if len(parts) > 2 and parts[-2].startswith("runs/") else ""
+        label, problems = name or f"line {i}", []
+        if not name or name in (".", "..") or "/" in name: problems.append("the line has no usable runs/<name> field")
+        else:
+            folder = os.path.join(home, "runs", name)
+            rec, sha, err = read_receipt(folder)
+            if err: problems.append(err)
+            else:
+                if sha != hexv: problems.append("receipt.json does not hash to the hex on the ledger line")
+                problems += check_receipt_files(folder, rec)
+                if rec.get("ledger_before") != before: problems.append("ledger_before differs: the ledger before this line is not as the receipt saw it")
+                if rec.get("previous") != prev: problems.append("previous differs from the hex on the previous receipt-bearing line")
+                if rec.get("run") != name or rec.get("status") != parts[-1]: problems.append("the ledger line's run or status differs from the receipt")
+                try:  # the receipt cannot hold the line it is carried on, so the line's cost is held against summary.json, which the receipt does hold
+                    with open(os.path.join(folder, "summary.json"), encoding="utf-8") as f: true = float(json.load(f)["true_cost"])
+                    c = re.search(r"\| true \$([0-9]+(?:\.[0-9]+)?)", line)
+                    if not c or c.group(1) != f"{true:.4f}": problems.append("the ledger line's true $ differs from summary.json")
+                except (OSError, ValueError, KeyError, TypeError): pass  # a missing or unreadable summary.json is already reported by the files check
+        prev = hexv
+        if problems: failed += 1; print(f"FAIL {label}: " + "; ".join(problems))
+        else: ok += 1; print(f"ok {label}")
+    print(f"{ok} receipts ok, {failed} failed, {bare} lines without a receipt")
+    return 0 if not failed else 1
+
+
+def verify_folder(folder):
+    name = os.path.basename(os.path.realpath(folder))
+    rec, _, err = read_receipt(folder)
+    if err == "receipt.json is missing":
+        print(f"no receipt in {folder}"); return 1
+    bad = [err] if err else check_receipt_files(folder, rec)
+    if bad: print(f"FAIL {name}: " + "; ".join(bad)); return 1
+    print(f"ok {name}: {len(RECEIPT_FILES)} files match the receipt"); return 0
+
+
 # ---- the fence -----------------------------------------------------------------------------------------------------------------
 
 SB_TEMPLATE = """(version 1)
@@ -425,6 +526,8 @@ def sb_rule(action, op, *filters):
 
 def sub(p): return f"(subpath {sb_str(p)})"
 def lit(p): return f"(literal {sb_str(p)})"
+def rex(pattern): return f'(regex #"{pattern}")'
+def rex_escape(path): return re.sub(r"([.+*?()\[\]{}|^$\\])", r"\\\1", path)  # a path inside a regex, its special characters escaped
 def under(a, b): return a == b or a.startswith(b.rstrip("/") + "/")
 
 
@@ -451,8 +554,12 @@ def fence_profile(c):
     if not c.readonly: out.append(sb_rule("allow", "file-write*", sub(c.folders[0])))
     out += ["; the tool's own home stays refused whatever the run's folder is: its config, cap, ledger, and the briefs and events of other runs",
             sb_rule("deny", "file-read*", sub(c.siwithin_home)), sb_rule("deny", "file-write*", sub(c.siwithin_home)),
-            "; the CLI's own config directory, where it keeps its state and finds no login unless one was put there",
-            sb_rule("allow", "file-read*", sub(c.config_dir)), sb_rule("allow", "file-write*", sub(c.config_dir))]
+            "; the CLI's own config directory, where it keeps its state and finds no login unless one was put there: readable whole, writable in its state paths only,",
+            "; so settings, the state file, memory, commands, skills, agents, hooks, plugins, scheduled tasks and a key helper kept there stay as the owner left them",
+            sb_rule("allow", "file-read*", sub(c.config_dir)), sb_rule("deny", "file-write*", sub(c.config_dir)),
+            sb_rule("allow", "file-write*", *[sub(os.path.join(c.config_dir, p)) for p in f.get("config_write", [])]),
+            "; the memory folder the CLI keeps under each transcript folder is read by its next run there, so it stays unwritable",
+            sb_rule("deny", "file-write*", rex("^" + rex_escape(c.config_dir) + "/projects/[^/]+/memory(/|$)"))]
     allowed = list(c.folders) + reads + writes + [c.config_dir, c.run]
     if c.tmp:
         out += ["; the run's temp root, where the CLI keeps each command's output", sb_rule("allow", "file-read*", sub(c.run + "/tmp")), sb_rule("allow", "file-write*", sub(c.run + "/tmp"))]
@@ -817,6 +924,7 @@ def execute(P, cfg):
             notes.append("killed before the CLI's result: the true cost is the usage streamed up to the kill, input and cache tokens at the [prices] rates and output tokens as the stream reported them "
                          "(a placeholder), so what was spent is higher and the CLI's own figure was never reported")
     if st["errors"]: notes.append("CLI errors: " + "; ".join(st["errors"][:3]))
+    if st["text_is_last_message"]: notes.append("the CLI's result carried no text: result.md holds the model's last message from the stream")
     if P.mode == "turn": notes.append("budget checked when each turn ends, not while a turn runs (--soft-budget)")
     if true > P.budget + 1e-9 and not ceiling: notes.append(f"over budget: true ${true:.4f} against budget ${P.budget:.2f}")
     status = "done"
@@ -848,14 +956,29 @@ def execute(P, cfg):
     tcost = f"true ${true:.4f}" + (" (ceiling, usage unreported)" if ceiling else "")
     ccost = f"cli ${cli:.4f}" if cli is not None else "cli $-"
     first = f"{P.adapter} {P.label} {P.effort or '-'} | {st['turns'] or '-'} turns | {mins:.1f} min | {ccost} | {tcost} | in {tin // 1000}k out {tout // 1000}k"
-    new = not os.path.exists(P.ledger_path)
+    if not os.path.exists(P.ledger_path):
+        with open(P.ledger_path, "w", encoding="utf-8") as f: f.write(f"# {NAME} ledger: one line per run, appended when the run ends; the cap counts the 'true' column, the cost at the [prices] rates in config.toml\n")
+    # The receipt: written by the runner after the CLI has exited, under the lock, from the ledger as it stands before this run's line. summary.json cannot carry
+    # the receipt's hash, because the receipt hashes summary.json: the hash goes on the ledger line, and on the terminal.
+    receipt = None
+    try:
+        with open(P.ledger_path, "rb") as f: held = f.read()
+        previous = None
+        for ln in held.decode("utf-8", "replace").split("\n"):
+            m = RECEIPT_TAIL.search(ln)
+            if m: previous = m.group(1)
+        body = receipt_bytes({"receipt": 1, "tool": f"{NAME} {VERSION}", "run": os.path.basename(run), "started": t0.isoformat(timespec="seconds"),
+                              "ended": datetime.datetime.now().isoformat(timespec="seconds"), "status": clean(status),
+                              "files": {n: sha256_file(f"{run}/{n}") for n in RECEIPT_FILES}, "ledger_before": hashlib.sha256(held).hexdigest(), "previous": previous})
+        with open(f"{run}/receipt.json", "wb") as f: f.write(body)
+        receipt = hashlib.sha256(body).hexdigest()
+    except OSError as x: notes.append(f"no receipt written ({x}): the ledger line carries none")  # the money is spent: the line is still booked, or the cap would not count it
     with open(P.ledger_path, "a", encoding="utf-8") as f:
-        if new: f.write(f"# {NAME} ledger: one line per run, appended when the run ends; the cap counts the 'true' column, the cost at the [prices] rates in config.toml\n")
-        f.write(f"{t0.strftime('%Y-%m-%d %H:%M')} | {P.slug} | {d} | {first} | runs/{os.path.basename(run)} | {clean(status)}\n")
+        f.write(f"{t0.strftime('%Y-%m-%d %H:%M')} | {P.slug} | {d} | {first} | runs/{os.path.basename(run)} | {clean(status)}" + (f" | receipt {receipt}" if receipt else "") + "\n")
     total, _ = ledger_total(P.ledger_path)
     print(f"{NAME} {status} | {P.adapter} {P.label} {P.effort or '-'} | {st['turns'] or '-'} turns | {mins:.1f} min | {ccost} | {tcost} | in {tin // 1000}k out {tout // 1000}k"
-          f" | paid by {st['key_source'] or '-'} | denials {len(st['denials'])} | ledger true total ${total:.2f} of cap ${P.cap:.0f}\nrun: {run}\nsession: {st['session']}"
-          + (f"\nout: {out_path}" if out_path else ""), flush=True)
+          f" | paid by {st['key_source'] or '-'} | denials {len(st['denials'])} | ledger true total ${total:.2f} of cap ${P.cap:.2f}\nrun: {run}\nsession: {st['session']}"
+          + (f"\nreceipt: {receipt}" if receipt else "") + (f"\nout: {out_path}" if out_path else ""), flush=True)
     if "done" in contract: print(f"done text {contract['done']['text']!r}: " + ("found" if contract["done"]["found"] else "MISSING"))
     if "absent" in contract: print(f"absent text {contract['absent']['text']!r}: " + ("FOUND" if contract["absent"]["found"] else "not in the result"))
     for t, i in st["denials"]: print(f"denied: {t} {i}")
@@ -867,7 +990,8 @@ def execute(P, cfg):
 def parse_args(argv):
     a = argparse.ArgumentParser(prog=NAME, description="Run an agent CLI headless on a brief (stdin), inside a folder fence, under a dollar budget and a cap.")
     add = a.add_argument
-    add("--dir", help="the run's folder: writable unless --readonly, the CLI works in it")
+    add("--dir", help="the run's folder: writable unless --readonly, the CLI works in it (required unless --verify)")
+    add("--verify", nargs="?", const=True, metavar="RUN", help="check the ledger's receipts, or one run folder's files against its receipt; runs nothing")
     add("--read", action="append", default=[], help="a folder the run may read, repeatable")
     add("--readonly", action="store_true", help="the run's folder is readable only")
     add("--adapter", help="which CLI adapter: claude, codex, or one declared in config.toml (default from config)")
@@ -887,7 +1011,7 @@ def parse_args(argv):
     add("--dry-run", action="store_true", help="print the command, the fence, the checks and the budget arithmetic; run nothing")
     add("--version", action="version", version=f"{NAME} {VERSION}")
     o = a.parse_args(argv)
-    if not o.dir: a.error("--dir is required")
+    if not o.dir and not o.verify: a.error("--dir is required")
     return o
 
 
@@ -897,6 +1021,7 @@ def main(argv=None):
         if sys.platform == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
         home = derive_home()
         siwithin_home = real(o.home) if o.home else os.path.join(home, ".config", NAME)
+        if o.verify: return verify_ledger(siwithin_home) if o.verify is True else verify_folder(o.verify)  # no lock, no config
         cfg, cfg_path, present, problems = load_config(siwithin_home)
         brief = sys.stdin.read() if (sys.stdin is not None and not sys.stdin.isatty()) else None
         now = datetime.datetime.now()

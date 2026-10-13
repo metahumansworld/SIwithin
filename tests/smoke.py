@@ -5,7 +5,7 @@ Part 1 runs siwithin.py --dry-run as a subprocess for each built-in adapter and 
 the refusal of forbidden folders, the cap arithmetic and the adapters' refusals. Part 2 checks the pieces: the TOML reader, the example config,
 the money, the profile builder. Part 3 (macOS) drives a whole run in-process against fake CLIs with the sandbox program replaced by a shim that
 only drops its profile argument: it tests what the tool does around the CLI (streaming, kills, ledger, summary), not the fence itself."""
-import copy, importlib.util, io, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile, textwrap, time
+import copy, hashlib, importlib.util, io, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile, textwrap, time
 
 sys.dont_write_bytecode = True  # importing siwithin.py must not leave a __pycache__ in the project
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,7 +79,11 @@ try:
     check(f'(allow file-read* (subpath "{PROJ}"))' in lines and f'(allow file-write* (subpath "{PROJ}"))' in lines, "first folder readable and writable")
     check(f'(allow file-read* (subpath "{READ}"))' in lines and f'(allow file-write* (subpath "{READ}"))' not in lines, "--read folder readable only")
     check(f'(deny file-read* (subpath "{FH}"))' in lines and f'(deny file-write* (subpath "{FH}"))' in lines, "the tool's own home refused")
-    check(f'(allow file-read* (subpath "{FH}/claude-config"))' in lines and f'(allow file-write* (subpath "{FH}/claude-config"))' in lines, "the CLI's config directory allowed back")
+    check(f'(allow file-read* (subpath "{FH}/claude-config"))' in lines and f'(deny file-write* (subpath "{FH}/claude-config"))' in lines, "the CLI's config directory readable, and refused for writing as a whole")
+    state = [i for i, x in enumerate(lines) if x.startswith("(allow file-write*") and f'(subpath "{FH}/claude-config/projects")' in x]
+    check(len(state) == 1 and f'(subpath "{FH}/claude-config/sessions")' in lines[state[0]] and "claude-config/settings.json" not in lines[state[0]], "the config directory's state paths allowed back, the settings file not among them")
+    check(bool(state) and lines.index(f'(deny file-write* (subpath "{FH}/claude-config"))') < state[0], "the state allow comes after the config directory's deny, so it wins")
+    check(any(x.startswith("(deny file-write* (regex #") and "/projects/[^/]+/memory(/|$)" in x for x in lines), "memory folders under the transcripts refused")
     check(lines.index(f'(deny file-read* (subpath "{HOME}"))') < lines.index(f'(allow file-read* (subpath "{PROJ}"))') < lines.index(f'(deny file-read* (subpath "{FH}"))'),
           "later rules win: home deny, then folders, then the tool's home deny")
     check(any(f'(literal "{HOME}/.zshrc")' in x and x.startswith("(allow file-read*") for x in lines) and any(f'"{HOME}/Library/Keychains"' in x for x in lines), "rc files and keychain allowed back")
@@ -100,7 +104,7 @@ try:
     bud = section(out, "budget", "\0")
     N = siwithin.NAME
     rc, out, err = tool_cli(["--version"])
-    check(rc == 0 and out.strip() == "siwithin 0.1.2", f"--version prints siwithin 0.1.2: {out.strip()!r}")
+    check(rc == 0 and out.strip() == "siwithin 0.2.0", f"--version prints siwithin 0.2.0: {out.strip()!r}")
     check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
     check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
           "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -228,6 +232,14 @@ try:
     check(st["assistant_events"] == 5 and st["usage_events"] == 4 and list(st["usage"]) == ["claude-sonnet-5-5"], "stream usage: an event without usage is counted as such, and an all-zero message adds no model")
     siwithin.feed_claude(st, {"type": "result", "subtype": "success", "result": "x", "num_turns": 1, "total_cost_usd": 0.1, "modelUsage": {"claude-haiku-5-5": {"inputTokens": 7, "costUSD": 0.1}}}, {})
     check(st["complete"] and list(st["usage"]) == ["claude-haiku-5-5"] and st["usage"]["claude-haiku-5-5"]["in"] == 7, "the result event replaces what streamed")
+    st = siwithin.new_state("claude-haiku-5-5")
+    siwithin.feed_claude(st, {"type": "assistant", "message": {"id": "m9", "usage": {"output_tokens": 8}, "content": [{"type": "text", "text": "part 32 written"}]}}, {})
+    siwithin.feed_claude(st, {"type": "result", "subtype": "error_max_budget_usd", "is_error": True, "errors": ["Reached maximum budget ($0.1)"], "num_turns": 32, "total_cost_usd": 0.109, "modelUsage": {}}, {})
+    check(st["failed"] == "stopped by the CLI's budget flag: Reached maximum budget ($0.1)" and st["text"] == "part 32 written" and st["text_is_last_message"], f"the CLI's budget stop is named in its own words, and the last message stands in for the missing result text: {st['failed']!r}")
+    st = siwithin.new_state("claude-haiku-5-5"); siwithin.feed_claude(st, {"type": "result", "subtype": "error_max_turns", "is_error": True, "errors": ["Reached maximum number of turns (3)"], "num_turns": 3}, {})
+    check(st["failed"] == "stopped by the CLI, error_max_turns: Reached maximum number of turns (3)", f"any other stop of the CLI's is named with its subtype: {st['failed']!r}")
+    st = siwithin.new_state("claude-haiku-5-5"); siwithin.feed_claude(st, {"type": "result", "subtype": "error_during_execution", "is_error": True, "terminal_reason": "api_error", "api_error_status": 529, "result": "overloaded", "num_turns": 1}, {})
+    check(st["failed"] == "api error 529: overloaded", f"an API failure keeps its name and status: {st['failed']!r}")
     check(siwithin.forbidden_reason("/a/B/c", "/a", [("/a/b", "x")]) is not None and siwithin.forbidden_reason("/a/bb", "/a", [("/a/b", "x")]) is None and siwithin.forbidden_reason("/", "/a", []) is not None, "forbidden_reason: case-insensitive, whole path parts, ancestors of the home")
     c = siwithin.SimpleNamespace(home="/h", folders=["/h/p"], readonly=False, siwithin_home="/h/.config/f", config_dir="/h/.config/f/c", run="/h/.config/f/runs/r", tmp=False, last_message=False,
                               fence=dict(siwithin.DEFAULT_CONFIG["fence"], write_home=[], deny_exec=[], rc_files=[]), read_extra=[], write_extra=[])
@@ -267,6 +279,11 @@ if "MODE:overbudget" in brief:  # $0.25 (the response is sent twice, and counts 
 elif "MODE:nousage" in brief: ev({{"type": "assistant", "message": {{"content": []}}}})
 elif "MODE:unpriced" in brief: msg("msg_U", model="claude-mystery-1", input_tokens=50000000)
 else: msg("msg_A", cache_creation_input_tokens=100000); msg("msg_A", cache_creation_input_tokens=100000); msg("msg_B", input_tokens=100000)  # $0.4502, under a budget of $0.50
+if "MODE:clibudget" in brief:  # the CLI's own budget flag stops the run: a result with is_error, errors, and no result text
+    ev({{"type": "assistant", "message": {{"id": "msg_C", "model": "claude-sonnet-5-5", "usage": {{"input_tokens": 1000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 8, "service_tier": "standard"}}, "content": [{{"type": "text", "text": "last words before the stop"}}]}}}})
+    ev({{"type": "result", "subtype": "error_max_budget_usd", "is_error": True, "num_turns": 3, "errors": ["Reached maximum budget ($0.5)"], "total_cost_usd": 0.5, "session_id": "sess-1",
+        "modelUsage": {{"claude-sonnet-5-5": {{"inputTokens": 100000, "outputTokens": 10000, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "webSearchRequests": 0, "costUSD": 0.5}}}}, "permission_denials": []}})
+    sys.exit(1)
 text = "All good. DONE-MARKER" + (" TODO" if "MODE:todo" in brief else "")
 ev({{"type": "result", "subtype": "success", "is_error": False, "num_turns": 3, "result": text, "total_cost_usd": 0.3, "session_id": "sess-1",
     "modelUsage": {{"claude-sonnet-5-5": {{"inputTokens": 100000, "outputTokens": 10000, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "webSearchRequests": 0, "costUSD": 0.3}}}},
@@ -305,6 +322,8 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
 
         def ledger(): return open(os.path.join(EF, "ledger.md")).read().strip().split("\n")
 
+        def bare(line): return re.sub(r" \| receipt [0-9a-f]{64}$", "", line)  # the line as it was before the receipt field, the status last
+
         rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--name", "first run!", "--out", "out/result.txt", "--done", "DONE-MARKER", "--absent", "TODO"])
         r, s = last_run()
         check(rc == 0 and s["status"] == "done", f"claude run done: rc {rc}, {s.get('status')}, {err}")
@@ -316,7 +335,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(len(open(os.path.join(r, "events.jsonl")).read().strip().split("\n")) == 5, "events.jsonl holds the CLI's events")
         check(s["stream_cost"] == 0.4502, f"the summary holds what the stream priced: {s['stream_cost']}")
         L = ledger()
-        check(len(L) == 2 and L[0].startswith("# ") and re.search(r"\| first-run \| .*\| claude sonnet - \| 3 turns \| .* min \| cli \$0\.3000 \| true \$0\.3000 \| in 100k out 10k \| runs/.*-first-run \| done$", L[1]), f"one ledger line: {L[-1]}")
+        check(len(L) == 2 and L[0].startswith("# ") and re.search(r"\| first-run \| .*\| claude sonnet - \| 3 turns \| .* min \| cli \$0\.3000 \| true \$0\.3000 \| in 100k out 10k \| runs/.*-first-run \| done \| receipt [0-9a-f]{64}$", L[1]), f"one ledger line: {L[-1]}")
         check("true $0.30 of cap $100" in out.replace("0.3000", "0.30") or "ledger true total $0.30 of cap $100" in out, "summary line carries the ledger total and the cap")
         check("paid by ANTHROPIC_API_KEY" in out and "denials 1" in out and "denied: Bash" in out and out.startswith(f"{siwithin.NAME} done | claude sonnet -"), "summary line in the seed's format")
         every = "".join(open(os.path.join(r, f)).read() for f in os.listdir(r) if os.path.isfile(os.path.join(r, f))) + open(os.path.join(EF, "ledger.md")).read() + out + err
@@ -330,6 +349,11 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(rc == 1 and s["status"] == "finished, contract unmet: done text missing" and not os.path.exists(os.path.join(ED, "second.txt")) and "MISSING" in out and "not written" in " ".join(s["notes"]), f"contract unmet: {s['status']}")
         rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--absent", "TODO"], brief="MODE:todo")
         check(rc == 1 and "absent text found" in last_run()[1]["status"] and "FOUND" in out, "--absent text found makes the run not done")
+        rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--budget", "0.5"], brief="MODE:clibudget")
+        r, s = last_run(); STOPPED = "stopped by the CLI's budget flag: Reached maximum budget ($0.5)"
+        check(rc == 1 and s["status"] == STOPPED and out.startswith(f"{siwithin.NAME} {STOPPED} | claude sonnet -"), f"the CLI's own budget stop is named, not called an api error: {s['status']!r}")
+        check(bare(ledger()[-1]).endswith(f"| {STOPPED}") and "cli $0.5000" in ledger()[-1], f"the ledger line carries the CLI's stop: {ledger()[-1]}")
+        check(open(os.path.join(r, "result.md")).read() == "last words before the stop" and any("result carried no text" in n for n in s["notes"]), f"result.md holds the last message when the CLI's result has no text, and the notes say so: {s['notes']}")
         rc, out, err = whole(["--dir", ED], brief="MODE:wrongkey")
         r, s = last_run()
         check(rc == 1 and s["status"].startswith("killed: key source is 'none'") and s["true_cost"] == 0 and not s["true_cost_is_ceiling"], f"wrong key source killed at init, nothing billed: {s['status']}")
@@ -351,7 +375,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         t0 = time.time(); rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--budget", "0.5", "--timeout", "30"], brief="MODE:overbudget")
         r, s = last_run(); KILLED = "killed: budget $0.50 reached at $0.5502 true"
         check(rc == 1 and s["status"] == KILLED and time.time() - t0 < 20, f"streamed usage past the budget: the run is killed, with the exact reason ({s['status']}, {err})")
-        check(ledger()[-1].endswith(f"| {KILLED}") and "true $0.5502" in ledger()[-1] and "cli $-" in ledger()[-1], f"the ledger line says it was killed for the budget: {ledger()[-1]}")
+        check(bare(ledger()[-1]).endswith(f"| {KILLED}") and "true $0.5502" in ledger()[-1] and "cli $-" in ledger()[-1], f"the ledger line says it was killed for the budget: {ledger()[-1]}")
         check(out.startswith(f"{siwithin.NAME} {KILLED} | claude sonnet -") and abs(s["true_cost"] - 0.5502) < 1e-9 and not s["true_cost_is_ceiling"] and s["stream_cost"] == 0.5502, f"the summary line and summary.json: {out[:90]}")
         check(any("killed before the CLI's result" in n and "placeholder" in n for n in s["notes"]), f"the summary notes say the figure is what streamed: {s['notes']}")
         cmd_line = shlex.split(open(os.path.join(r, "command.txt")).read().split("\n", 1)[0])
@@ -398,6 +422,73 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         r, s = last_run()
         check(rc == 1 and s["status"].startswith("killed: budget $1.00 reached") and not s["true_cost_is_ceiling"] and time.time() - t0 < 30, f"codex starts a second turn past the budget: killed ({s['status']})")
         check(siwithin.ledger_total(os.path.join(EF, "ledger.md"))[1] == len(ledger()) - 1, "every run is one ledger line")
+
+        group("receipts")
+        sha = lambda p: siwithin.sha256_file(p)
+        TAIL = re.compile(r" \| receipt ([0-9a-f]{64})$")
+        carried = [(TAIL.search(l).group(1), re.search(r"\| runs/([^|]+?) \|", l).group(1)) for l in ledger() if TAIL.search(l)]
+        recs = [json.load(open(os.path.join(EF, "runs", n, "receipt.json"), encoding="utf-8")) for _, n in carried]
+        N_R = len(carried)
+        check(N_R >= 2 and N_R == len(ledger()) - 1 and all(sha(os.path.join(EF, "runs", n, "receipt.json")) == hx for hx, n in carried),
+              f"every ledger line of the home carries a receipt, {N_R} of them, and the hex on each is the sha256 of its receipt.json")
+        check(recs[0]["previous"] is None and all(recs[i]["previous"] == carried[i - 1][0] for i in range(1, N_R)), "the first receipt's previous is null, each later one's is the hex on the previous line")
+        check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
+                  for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
+        r0 = recs[0]
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.2.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+              and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
+              f"the first receipt's fields: {r0}")
+        raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
+        check(raw0 == (json.dumps(r0, sort_keys=True, indent=1, ensure_ascii=False) + "\n").encode("utf-8"), "receipt.json is the canonical JSON, sorted keys, indent 1, a newline last")
+        header = ledger()[0] + "\n"
+        check(r0["ledger_before"] == hashlib.sha256(header.encode("utf-8")).hexdigest(), "the first receipt's ledger_before is the hash of the header line alone")
+        summaries = {n: json.load(open(os.path.join(EF, "runs", n, "summary.json"))) for n in os.listdir(os.path.join(EF, "runs"))}
+        refused = [n for n, s in summaries.items() if s["status"].startswith("refused:")]
+        keyed = [n for n, s in summaries.items() if s["status"].startswith("killed: key source is 'none'")]
+        check(len(refused) == 1 and not os.path.exists(os.path.join(EF, "runs", refused[0], "receipt.json")) and not any(n == refused[0] for _, n in carried), "a run refused before launch has no receipt.json and no ledger line")
+        check(len(keyed) == 1 and os.path.exists(os.path.join(EF, "runs", keyed[0], "receipt.json")) and any(n == keyed[0] for _, n in carried), "the MODE:wrongkey run was killed after launch, so it is booked and has a receipt")
+        rc, out, err = tool_cli(["--verify", "--home", EF]); vl = out.strip().split("\n")
+        check(rc == 0 and len(vl) == N_R + 1 and all(l.startswith("ok ") for l in vl[:-1]) and vl[-1] == f"{N_R} receipts ok, 0 failed, 0 lines without a receipt", f"--verify on the home: rc {rc}, {vl[-1]!r}")
+
+        def copy_home(tag):
+            dst = os.path.join(TMP, "copy-" + tag); shutil.copytree(EF, dst); return dst
+
+        C1 = copy_home("result"); name = carried[0][1]; p = os.path.join(C1, "runs", name, "result.md")
+        b = bytearray(open(p, "rb").read()); b[0] ^= 1; open(p, "wb").write(bytes(b))
+        rc, out, err = tool_cli(["--verify", "--home", C1])
+        check(rc == 1 and any(l.startswith(f"FAIL {name}:") and "result.md" in l for l in out.split("\n")) and out.count("FAIL") == 1 and f"{N_R - 1} receipts ok, 1 failed" in out, f"one byte of a result.md changed: {out!r}")
+        C2 = copy_home("cost"); lp = os.path.join(C2, "ledger.md"); L2 = open(lp).read().split("\n")
+        i = [k for k, l in enumerate(L2) if f"runs/{carried[0][1]} |" in l][0]
+        L2[i] = re.sub(r"true \$[0-9.]+", "true $0.0001", L2[i]); open(lp, "w").write("\n".join(L2))
+        rc, out, err = tool_cli(["--verify", "--home", C2]); vl = out.split("\n")
+        check(rc == 1 and any(l.startswith(f"FAIL {carried[0][1]}:") and "true $" in l for l in vl) and any(l.startswith(f"FAIL {carried[1][1]}:") and "ledger_before" in l for l in vl), f"the true $ of an earlier line edited: that line and the next fail: {out!r}")
+        C3 = copy_home("hex"); lp = os.path.join(C3, "ledger.md"); t = open(lp).read()
+        open(lp, "w").write(t.replace(carried[-1][0], "ab" * 32))
+        rc, out, err = tool_cli(["--verify", "--home", C3])
+        check(rc == 1 and any(l.startswith(f"FAIL {carried[-1][1]}:") for l in out.split("\n")) and out.count("FAIL") == 1, f"the last line's hex replaced: {out!r}")
+
+        OLD = os.path.join(EH, ".config", "siwithin-old"); os.makedirs(OLD)
+        write(os.path.join(OLD, "cap"), "100"); write(os.path.join(OLD, "config.toml"), open(os.path.join(EF, "config.toml")).read())
+        write(os.path.join(OLD, "ledger.md"), f"# {siwithin.NAME} ledger\n2026-09-01 09:00 | old | /x | claude sonnet - | 3 turns | 1.0 min | cli $1.0000 | true $1.0000 | in 1k out 1k | runs/old | done\n")
+        old_bytes = open(os.path.join(OLD, "ledger.md"), "rb").read()
+        rc, out, err = whole(["--home", OLD, "--dir", ED, "--model", "sonnet"])
+        shown = re.search(r"\nsession: .*\nreceipt: ([0-9a-f]{64})\n", out)
+        check(rc == 0 and shown and TAIL.search(open(os.path.join(OLD, "ledger.md")).read().strip().split("\n")[-1]).group(1) == shown.group(1),
+              f"a run in a home with an older ledger: the receipt line follows the session line and is the hex on the ledger line: {err}")
+        rc, out, err = tool_cli(["--verify", "--home", OLD])
+        check(rc == 0 and out.strip().split("\n")[-1] == "1 receipts ok, 0 failed, 1 lines without a receipt", f"a ledger from before receipts: its line counted, not failed: {out!r}")
+        orun = os.path.join(OLD, "runs", os.listdir(os.path.join(OLD, "runs"))[0]); orec = json.load(open(os.path.join(orun, "receipt.json")))
+        check(orec["previous"] is None and orec["ledger_before"] == hashlib.sha256(old_bytes).hexdigest(), "the first receipt after old lines: previous null, ledger_before the old ledger's hash")
+
+        rc, out, err = tool_cli(["--verify", os.path.join(EF, "runs", carried[0][1])])
+        check(rc == 0 and out.strip() == f"ok {carried[0][1]}: 7 files match the receipt", f"--verify on a run folder: {out!r}")
+        rc, out, err = tool_cli(["--verify", os.path.join(C1, "runs", name)])
+        check(rc == 1 and out.startswith(f"FAIL {name}:") and "result.md" in out, f"--verify on a tampered run folder: {out!r}")
+        rc, out, err = tool_cli(["--verify", os.path.join(EF, "runs", refused[0])])
+        check(rc == 1 and out.startswith("no receipt in "), f"--verify on a folder with no receipt: {out!r}")
+        NOHOME = os.path.join(TMP, "nohome"); os.makedirs(NOHOME)
+        rc, out, err = tool_cli(["--verify", "--home", NOHOME])
+        check(rc == 1 and out.startswith("no ledger at ") and out.strip().endswith(os.path.join(NOHOME, "ledger.md")), f"--verify with no ledger: {out!r}")
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
 

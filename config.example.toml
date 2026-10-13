@@ -13,7 +13,8 @@ folders = []         # folders no run is given as --dir or --read, on top of the
 
 [fence]
 read_home = ["Library/Caches", "Library/Logs", "Library/Keychains", "Library/Python", ".gitconfig", ".config/git"]  # home-relative paths a run may read, on top of its folders
-write_home = ["Library/Caches", "Library/Logs", "Library/Keychains"]  # home-relative paths a run may write, on top of its writable folder
+write_home = ["Library/Caches", "Library/Logs"]  # home-relative paths a run may write, on top of its writable folder
+config_write = ["projects", "sessions", "session-env", "shell-snapshots", "file-history", "todos", "tasks", "debug", "statsig", "telemetry", "cache", "state", "logs", "paste-cache", "history.jsonl", ".last-cleanup"]  # paths inside the CLI's config directory a run may write, its state; the rest of that directory, settings, memory, skills, plugins and a key helper included, stays as the owner left it
 rc_files = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout", ".bash_profile", ".bash_login", ".bashrc", ".profile"]  # home-relative shell files a run may read; list files these source in read_home
 deny_write = ["/private/tmp", "/tmp", "/opt", "/usr/local", "/Applications", "/Library", "/Volumes"]  # roots outside the home where writes are refused
 deny_exec = ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay"]  # programs a run may not start
