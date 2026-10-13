@@ -4,5 +4,4 @@ nohome/
 tests/live/
 tests/red/home/
 tests/red/dir/
-tests/red/scorecard-*.md
 *.tgz

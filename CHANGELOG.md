@@ -2,6 +2,7 @@
 
 ## v0.2.1, 2026-10-14
 
+- 2026-10-14, after the release, a documentation and tests commit with `siwithin.py` unchanged: the red briefs are in the tree, `tests/red/` (README, Tests): the runner with `--fake` and `--live`, the five briefs, and the three scorecards of that day's live passes, four walls held in each and the budget stop by design. Scorecards are tracked from now on. `--live` takes the red home's `config.toml` from `config.example.toml` when the maintainer's live config is absent. The runner writes the home directory as `~` in a scorecard, and the two scorecards that carried a full path were edited so by hand, with a note.
 - 2026-10-14: released, the runner 0.2.0's with the line below; the smoke test passes 168 checks with fake CLIs.
 - 2026-10-14: the budget prints with four decimals where two would show `$0.00`: in the kill status `killed: budget $… reached at $… true`, the over-budget note, the cap check and the `--dry-run` text. A budget of $0.0001 printed as `$0.00` in a live run that day. A budget exact at two decimals prints as before.
 
