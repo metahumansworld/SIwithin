@@ -6,7 +6,7 @@ Usage: python3 siwithin.py --dir <folder> [--adapter claude|codex] [--model M] [
        [--read <folder>]... [--readonly] [--name <slug>] [--out <file, inside --dir>] [--resume <session id>]
        [--done "<text>"] [--absent "<text>"] [--soft-budget] [--require-api-key | --no-require-api-key]
        [--home <folder>] [--dry-run] < brief
-       siwithin.py --verify [<run folder>] [--home <folder>]
+       siwithin.py --verify [<run folder>] [--expect <hash>] [--home <folder>]
 The brief comes on stdin. The tool's home (default ~/.config/siwithin) holds config.toml, cap, ledger.md, lock and runs/; each run's folder under
 runs/ gets the brief, the command, the fence profile, the CLI's events and stderr, result.md, summary.json and receipt.json. macOS only in v0.1.
 The receipt, written by the runner after the CLI has exited, holds the sha256 of each file the runner wrote, the hash of the ledger as it stood and the previous
@@ -26,22 +26,25 @@ Findings from the launcher this grew out of, each made on a real CLI and kept be
 - Git is held to local subcommands, and the tools that launch further runs are dropped, so nothing leaves the machine and a run cannot start runs.
 - A CLI can price a model at another model's rates: its budget is then in units that are not dollars. [factors] holds the ratio and a check warns when it goes stale.
   A factor that is wrong lifts the CLI's flag by that much and nothing else stops the run, so where the CLI streams usage the budget is also kept here, in true dollars.
+- The key: a run that holds the API key can spend it where no stream shows it and send it anywhere, and the network is open. For an adapter with auth = "proxy" the runner keeps the
+  key, the run gets a token worth nothing elsewhere and a loopback address, and every request passes one door the runner meters: the true cost is that door's total.
 - A CLI's assistant events carry the usage of one API response each, and one response can arrive as several events with the same message id and the same usage:
   count each id once. Per-event output tokens are a placeholder (the count when the response began); the real output arrives only in the result event.
 """
 from __future__ import annotations
 
-import argparse, copy, datetime, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, threading
+import argparse, copy, datetime, hashlib, http.client, http.server, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, socketserver, ssl, subprocess, sys, threading, time, urllib.parse
 from types import SimpleNamespace
 
 try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 UNCONFIRMED = "unconfirmed"  # an adapter field holding this is a stub: any option that needs it is refused, naming the field
 ROADMAP = "README.md, 'What v0.1 does not do'"
+PROXY_TAG = "SIwithin"  # the name the key proxy's error bodies carry; change it with NAME
 PRICE_STALE_DAYS = 90
 
 
@@ -68,9 +71,11 @@ DEFAULT_CONFIG = {
         "config_write": ["projects", "sessions", "session-env", "shell-snapshots", "file-history", "todos", "tasks", "debug", "statsig", "telemetry", "cache", "state", "logs", "paste-cache", "history.jsonl", ".last-cleanup"],
         "rc_files": [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout", ".bash_profile", ".bash_login", ".bashrc", ".profile"],
         "deny_write": ["/private/tmp", "/tmp", "/opt", "/usr/local", "/Applications", "/Library", "/Volumes"],
-        "deny_exec": ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay"],
+        "deny_exec": ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay", "/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch"],
     },
     "env": {"pass": ["HOME", "PATH", "USER", "TMPDIR", "LANG", "SHELL", "TERM"]},
+    # The key proxy, for adapters with auth = "proxy": the runner keeps the key and the run gets a token and a loopback address.
+    "auth": {"key_command": "", "upstream": "https://api.anthropic.com", "upstream_timeout": 600, "paths": ["/v1/messages", "/v1/messages/count_tokens"]},
     # Dollars per million tokens: input, cache write, cache read, output. Read from the pages named in source, on read_on.
     "prices": {
         "read_on": "2026-10-13",
@@ -89,7 +94,8 @@ DEFAULT_CONFIG = {
     "adapters": {
         "claude": {
             "bin": "claude", "own_dir": "~/.claude", "config_dir": "{fence_home}/claude-config", "config_dir_env": "CLAUDE_CONFIG_DIR",
-            "tmp_env": "CLAUDE_CODE_TMPDIR", "read_home": [".local/bin", ".local/share/claude"], "write_home": [], "env_pass": ["ANTHROPIC_API_KEY"],
+            "tmp_env": "CLAUDE_CODE_TMPDIR", "read_home": [".local/bin", ".local/share/claude"], "write_home": [], "env_pass": [],
+            "auth": "proxy", "key_env": "ANTHROPIC_API_KEY", "base_url_env": "ANTHROPIC_BASE_URL", "key_header": "x-api-key",
             "output": "claude-stream-json", "usage_at": "message", "input_includes_cached": False,
             "brief": "stdin", "brief_arg": "", "cwd_flag": "", "model_flag": "--model", "effort_flag": "--effort", "effort_env": "CLAUDE_CODE_EFFORT_LEVEL",
             "turns_flag": "--max-turns", "budget_flag": "--max-budget-usd", "add_dir_flag": "--add-dir", "resume_flag": "--resume", "last_message_flag": "",
@@ -105,6 +111,7 @@ DEFAULT_CONFIG = {
         "codex": {
             "bin": "codex", "own_dir": "~/.codex", "config_dir": "{fence_home}/codex-config", "config_dir_env": "CODEX_HOME",
             "tmp_env": "", "read_home": [], "write_home": [], "env_pass": ["CODEX_API_KEY"],
+            "auth": "env", "key_env": "CODEX_API_KEY", "base_url_env": "", "key_header": "",
             "output": "codex-jsonl", "usage_at": "turn", "input_includes_cached": True,
             "brief": "stdin", "brief_arg": "-", "cwd_flag": "--cd", "model_flag": "--model", "effort_flag": UNCONFIRMED, "effort_env": "",
             "turns_flag": "", "budget_flag": "", "add_dir_flag": "", "resume_flag": UNCONFIRMED, "last_message_flag": "--output-last-message",
@@ -415,6 +422,7 @@ def money(x):
 # ---- the receipt: what a run's folder and the ledger held when the run ended, as hashes ------------------------------------------
 
 RECEIPT_FILES = ("brief.md", "command.txt", "fence.sb", "events.jsonl", "stderr.txt", "result.md", "summary.json")
+PROXY_LOG = "proxy.jsonl"  # after summary.json, on runs that had a key proxy
 RECEIPT_TAIL = re.compile(r" \| receipt ([0-9a-f]{64})$")
 
 
@@ -442,29 +450,36 @@ def read_receipt(folder):
 
 def check_receipt_files(folder, rec):
     files = rec.get("files")
-    if not isinstance(files, dict) or sorted(files) != sorted(RECEIPT_FILES): return [f"files does not list exactly {', '.join(RECEIPT_FILES)}"]
+    names = RECEIPT_FILES + ((PROXY_LOG,) if isinstance(files, dict) and PROXY_LOG in files or os.path.exists(os.path.join(folder, PROXY_LOG)) else ())  # a proxy log in the folder must be in the receipt
+    if not isinstance(files, dict) or sorted(files) != sorted(names): return [f"files does not list exactly {', '.join(names)}"]
     bad = []
-    for n in RECEIPT_FILES:
+    for n in names:
         try: same = sha256_file(os.path.join(folder, n)) == files[n]
         except OSError: bad.append(f"{n} is missing"); continue
         if not same: bad.append(f"{n} differs from the receipt")
     return bad
 
 
-def verify_ledger(home):
+def verify_ledger(home, expect=None):
+    """Checks every receipt-bearing line against its receipt and the chain. A line with no receipt is the 0.1 ledger's only before the first receipt; after it, it fails.
+    expect: the hash the last receipt-bearing line must carry, kept somewhere the ledger's writer cannot reach (the summary line printed at a run's end shows it)."""
     path = os.path.join(home, "ledger.md")
     try:
         with open(path, "rb") as f: data = f.read()
     except OSError:
         print(f"no ledger at {path}"); return 1
     ok = failed = bare = 0
-    prev, h = None, hashlib.sha256()
+    prev, first, h = None, None, hashlib.sha256()
     for i, raw in enumerate(data.split(b"\n"), 1):
         line, before = raw.decode("utf-8", "replace"), h.hexdigest()  # before: the ledger's bytes up to this line
         h.update(raw + b"\n")
         if not re.match(r"\d{4}-\d\d-\d\d ", line): continue
         m = RECEIPT_TAIL.search(line)
-        if not m: bare += 1; continue  # a line from before receipts: counted, not failed
+        if not m:
+            if first is None: bare += 1  # a line from before receipts: counted, not failed
+            else: failed += 1; print(f"FAIL line {i}: no receipt, after line {first} had one")  # a receipt stripped, or a line written by something that was not the runner
+            continue
+        first = first or i
         hexv, parts = m.group(1), line[:m.start()].split(" | ")
         name = parts[-2][5:] if len(parts) > 2 and parts[-2].startswith("runs/") else ""
         label, problems = name or f"line {i}", []
@@ -487,8 +502,10 @@ def verify_ledger(home):
         prev = hexv
         if problems: failed += 1; print(f"FAIL {label}: " + "; ".join(problems))
         else: ok += 1; print(f"ok {label}")
+    wrong = expect is not None and prev != expect.strip().lower()  # prev: the hex on the last receipt-bearing line, None when there was none
+    if wrong: print(f"FAIL: the last receipt is {prev or 'none'}, not {expect.strip().lower()}")
     print(f"{ok} receipts ok, {failed} failed, {bare} lines without a receipt")
-    return 0 if not failed else 1
+    return 0 if not failed and not wrong else 1
 
 
 def verify_folder(folder):
@@ -498,7 +515,7 @@ def verify_folder(folder):
         print(f"no receipt in {folder}"); return 1
     bad = [err] if err else check_receipt_files(folder, rec)
     if bad: print(f"FAIL {name}: " + "; ".join(bad)); return 1
-    print(f"ok {name}: {len(RECEIPT_FILES)} files match the receipt"); return 0
+    print(f"ok {name}: {len(rec['files'])} files match the receipt"); return 0
 
 
 # ---- the fence -----------------------------------------------------------------------------------------------------------------
@@ -604,7 +621,22 @@ def derive_home():
 def slugify(name): return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "run"
 
 
+def finite_money(o, cfg, cfg_path, siwithin_home):
+    """The dollar figures before anything else is read: nan and the infinities pass every comparison below them, so each is refused, naming where it came from."""
+    if o.budget is not None and not math.isfinite(o.budget): raise Refused("--budget must be a finite number above zero")
+    if o.budget is None:
+        try: ok = math.isfinite(float(cfg["defaults"]["budget"]))
+        except (TypeError, ValueError): ok = False
+        if not ok: raise Refused(f"[defaults] budget in {cfg_path} must be a finite number above zero")
+    cap_path = os.path.join(siwithin_home, "cap")
+    try:
+        with open(cap_path, encoding="utf-8") as f: cap = float(f.read().strip())
+    except (OSError, ValueError): return  # missing or unreadable: the cap check further down refuses it, with the way to write one
+    if not math.isfinite(cap) or cap < 0: raise Refused(f"cap in {cap_path} must be a finite number, zero or above")
+
+
 def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
+    finite_money(o, cfg, cfg_info[0], siwithin_home)
     P = SimpleNamespace(checks=[], notes=[], dry=dry)
     chk = lambda level, text: P.checks.append((level, text))
     if sys.platform == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
@@ -689,11 +721,25 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     elif ad["turns_flag"] not in ("", UNCONFIRMED) and d.get("turns"): P.turns = int(d["turns"])
     if P.turns is None and o.turns is None: chk("warn", f"adapter {name} has no turn limit: only --timeout and the budget stop a run")
 
+    # auth: the key proxy, or the key in the run's environment
+    au = cfg["auth"]
+    if not isinstance(au.get("key_command"), str) or not isinstance(au.get("upstream"), str): raise Refused("config.toml: [auth] key_command and upstream must be strings")
+    ut = au.get("upstream_timeout")
+    if isinstance(ut, bool) or not isinstance(ut, (int, float)) or not 0 < ut < 1e9: raise Refused("config.toml: [auth] upstream_timeout must be a number of seconds above zero")
+    paths = au.get("paths")
+    if not isinstance(paths, list) or not all(isinstance(p, str) and p.startswith("/") for p in paths): raise Refused("config.toml: [auth] paths must be a list of paths that start with /")
+    P.paths = paths
+    P.auth = ad["auth"] or "env"
+    if P.auth not in ("proxy", "env"): raise Refused(f"adapter {name}: auth must be proxy or env, not {P.auth!r}")
+    P.proxy_on, P.upstream, P.upstream_timeout = P.auth == "proxy", au["upstream"], ut
+    if P.proxy_on and not (ad["key_env"] and ad["base_url_env"]): raise Refused(f"adapter {name}: auth proxy needs key_env and base_url_env, the variables the run reads its key and its API address from")
+    P.key_sources = [ad["key_env"]] if P.proxy_on else list(ad["key_sources_ok"])  # through the proxy the run's key is the token, in the key variable
+
     # api key check
     req = o.require_api_key if o.require_api_key is not None else ad["require_api_key"]
     P.require_key = req
-    if req and not (ad["auth_status_args"] or ad["key_sources_ok"]): raise Refused(f"--require-api-key: adapter {name} has no auth status command and no key source in its events, so billing to an API key cannot be checked")
-    chk("ok" if req else "warn", f"api key: " + ("required: the CLI's auth status is asked before launch and the run is killed at its init event if the key source is not one of " + ", ".join(ad["key_sources_ok"]) if req else "not required: the run may be billed to a login"))
+    if req and not (ad["auth_status_args"] or P.key_sources): raise Refused(f"--require-api-key: adapter {name} has no auth status command and no key source in its events, so billing to an API key cannot be checked")
+    chk("ok" if req else "warn", f"api key: " + ("required: the CLI's auth status is asked before launch and the run is killed at its init event if the key source is not one of " + ", ".join(P.key_sources) if req else "not required: the run may be billed to a login"))
 
     # cap and ledger
     P.cap_path, P.ledger_path = os.path.join(siwithin_home, "cap"), os.path.join(siwithin_home, "ledger.md")
@@ -712,12 +758,33 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     stamp = now.strftime("%Y-%m-%d-%H%M"); run, k = os.path.join(siwithin_home, "runs", f"{stamp}-{P.slug}"), 2
     while os.path.exists(run): run = os.path.join(siwithin_home, "runs", f"{stamp}-{P.slug}-{k}"); k += 1
     P.run, P.stamp = run, stamp
-    env = {k: os.environ[k] for k in cfg["env"]["pass"] + ad["env_pass"] if k in os.environ}
+    passed = cfg["env"]["pass"] + ad["env_pass"] + ([ad["key_env"]] if not P.proxy_on and ad["key_env"] else [])
+    env = {k: os.environ[k] for k in passed if k in os.environ and not (P.proxy_on and k in (ad["key_env"], ad["base_url_env"]))}  # through the proxy the real key is never passed
+    if P.proxy_on: env[ad["key_env"]] = env[ad["base_url_env"]] = ""  # the names are listed now; execute puts the run's token and the proxy's address in
     if ad["config_dir_env"]: env[ad["config_dir_env"]] = P.config_dir
     if ad["tmp_env"]: env[ad["tmp_env"]] = run + "/tmp"
     if P.effort and ad["effort_env"]: env[ad["effort_env"]] = P.effort
     P.env = env
-    P.bin_path = shutil.which(ad["bin"], path=env.get("PATH") or os.defpath)
+    if P.proxy_on:
+        kenv = ad["key_env"]
+        up = urllib.parse.urlsplit(au["upstream"])
+        try: up.port
+        except ValueError: up = urllib.parse.urlsplit("")
+        if up.scheme not in ("http", "https") or not up.hostname or (up.scheme == "http" and up.hostname not in ("127.0.0.1", "localhost", "::1")):
+            chk("refuse", f"auth: upstream {au['upstream']!r} must be an https:// address (http:// only for a loopback host): the real key is sent there")
+        P.key_from = f"from {kenv}" if os.environ.get(kenv, "").strip() else "from [auth] key_command" if au["key_command"].strip() else None
+        if P.key_from: chk("ok", f"auth: proxy; the key stays in the runner ({P.key_from}); the run sees a token")
+        else: chk("warn" if dry else "refuse", f"auth: no key: export {kenv} for the runner, or set [auth] key_command")
+        settings = os.path.join(P.config_dir, "settings.json")
+        try:
+            with open(settings, encoding="utf-8") as f: text = f.read()
+        except OSError: text = None
+        if text is not None:
+            try: helper = isinstance(json.loads(text), dict) and "apiKeyHelper" in json.loads(text)
+            except ValueError: helper = "apiKeyHelper" in text  # unreadable as JSON: the name anywhere in it is enough to refuse
+            if helper: chk("refuse", f"auth: a key helper in {settings} is readable by the run; move it to [auth] key_command in config.toml and remove it from settings.json")
+    else: chk("warn", "auth: env; the key is in the run's environment and every command the run starts can read it")
+    P.bin_path =shutil.which(ad["bin"], path=env.get("PATH") or os.defpath)
     if P.bin_path: chk("ok", f"cli: {ad['bin']} at {P.bin_path}")
     else: chk("warn" if dry else "refuse", f"cli: {ad['bin']} not found on PATH" + ("; a real run would refuse" if dry else ""))
     chk("ok" if os.path.isdir(P.config_dir) else "warn", f"config directory of the run: {P.config_dir}" + ("" if os.path.isdir(P.config_dir) else " (created on the first run)"))
@@ -773,6 +840,9 @@ def show_plan(P):
     pr(f"{NAME} {VERSION} dry run: nothing is run, nothing is written")
     pr("\n== command ==\n" + shlex.join([SANDBOX_EXEC, "-f", P.sb_path] + P.shown))
     pr(f"cwd: {P.dirs[0]}\nstdin: " + ("the brief" if P.ad["brief"] == "stdin" else "none") + f"\nrun folder: {P.run}")
+    if P.proxy_on:
+        pr(f"auth: proxy 127.0.0.1:<port>\nupstream: {P.upstream}, {P.upstream_timeout}s a request; the port is chosen when a real run starts, and nothing listens in this one")
+        pr(f"paths: {', '.join(P.paths) or 'none'} ([auth] paths); any other path gets 403 and is not forwarded, and the real key is never attached to it")
     pr("\n== fence profile ==\n" + P.profile)
     pr("== config checks ==")
     for lv, t in P.checks: pr(f"{lv:<6} {t}")
@@ -792,12 +862,345 @@ def show_plan(P):
         else: pr(f"enforced by the CLI: {flag}; {NAME} reads the true cost at the end")
     elif P.mode == "stream": pr(f"enforced by {NAME}: usage is read as it streams and the run is killed when it reaches {money(P.budget)}")
     else: pr(f"checked by {NAME} when each turn ends (--soft-budget): the run is killed between turns once usage reaches {money(P.budget)}; one long turn can pass it unseen")
+    if P.proxy_on:
+        pr(f"through the key proxy: every request the run makes passes it and is priced at the [prices] rates; once its total reaches {money(P.budget)} every later /v1/messages request gets 402 and the run's process group is killed;\n"
+           "  the ledger's true $ is the proxy's total, what left this machine for the API through the only door")
     pr(f"time: killed after {P.timeout}s by a timer, always")
+    pr("processes: every process the run starts is killed with it, by ancestry and by the run's marker; nothing outlives the ledger line")
     if P.cap is None: pr(f"cap: unreadable ({P.cap_path})")
     else:
         after = P.total + P.budget
         pr(f"ledger: ${P.total:.2f} true over {P.nruns} runs ({P.ledger_path})\ncap: ${P.cap:.2f}\nworst case after this run: ${P.total:.2f} + {money(P.budget)} = ${after:.2f} of ${P.cap:.2f}, "
            + (f"within the cap, ${P.cap - after:.2f} left" if after <= P.cap else f"over the cap by ${after - P.cap:.2f}: REFUSED"))
+
+
+# ---- the key proxy: the runner keeps the key, the run holds a token, and every request passes this one door -----------------------
+
+HOP_BY_HOP = ("connection", "transfer-encoding", "keep-alive", "te", "trailer", "upgrade")
+MAX_BODY = 64 << 20  # a request body beyond this is refused; the API's own limit is lower
+
+
+def is_hop(name):
+    n = name.lower()
+    return n in HOP_BY_HOP or n.startswith("proxy-")
+
+
+def is_messages(path):
+    return path.rstrip("/").endswith("/v1/messages")  # not /v1/messages/count_tokens: that one is free
+
+
+def api_error(kind, msg):
+    return json.dumps({"type": "error", "error": {"type": kind, "message": f"{PROXY_TAG}: {msg}"}}).encode("utf-8")
+
+
+class Meter:
+    """The usage of one response, read as the bytes pass: a JSON body's usage, or an event stream's message_start and message_delta usage (running totals, the last count stands)."""
+    LIMIT = 32 << 20
+
+    def __init__(self, stream):
+        self.stream, self.parts, self.size, self.tail, self.usage, self.model, self.done = stream, [], 0, b"", None, None, False  # done: the stream's last event has been read
+
+    def take(self, u):
+        if not isinstance(u, dict): return
+        if self.usage is None: self.usage = {"in": 0, "cache_write": 0, "cache_read": 0, "out": 0, "searches": 0}
+        for k, f in STREAM_FIELDS:
+            if isinstance(u.get(f), int) and not isinstance(u.get(f), bool): self.usage[k] = max(0, u[f])
+        s = u.get("server_tool_use")
+        if isinstance(s, dict) and isinstance(s.get("web_search_requests"), int) and not isinstance(s.get("web_search_requests"), bool): self.usage["searches"] = max(0, s["web_search_requests"])
+
+    def line(self, ln):
+        ln = ln.strip()
+        if not ln.startswith(b"data:"): return
+        try: e = json.loads(ln[5:])
+        except ValueError: return
+        if not isinstance(e, dict): return
+        if e.get("type") == "message_start" and isinstance(e.get("message"), dict):
+            self.model = e["message"].get("model") or self.model; self.take(e["message"].get("usage"))
+        elif e.get("type") == "message_delta": self.take(e.get("usage"))
+        elif e.get("type") == "message_stop": self.done = True
+
+    def feed(self, chunk):
+        if self.stream:
+            *lines, self.tail = (self.tail + chunk).split(b"\n")
+            for ln in lines: self.line(ln)
+            if len(self.tail) > self.LIMIT: self.tail = b""
+        elif self.size <= self.LIMIT: self.parts.append(chunk); self.size += len(chunk)
+
+    def finish(self):
+        if self.stream:
+            if self.tail: self.line(self.tail)
+        elif self.size <= self.LIMIT:
+            try: j = json.loads(b"".join(self.parts))
+            except ValueError: return
+            if isinstance(j, dict): self.model = j.get("model") or self.model; self.take(j.get("usage"))
+
+
+class ProxyServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+    def handle_error(self, request, client_address): pass  # a client that went away is not news; the handler logs what matters
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a): pass
+
+    def setup(self):
+        super().setup(); self.server.proxy.client_up(self.request)
+
+    def finish(self):
+        try: super().finish()
+        finally: self.server.proxy.client_down(self.request)
+
+    def error(self, status, kind, msg, close=True):
+        body = api_error(kind, msg)
+        self.send_response_only(status)
+        for k, v in (("Content-Type", "application/json"), ("Content-Length", str(len(body)))) + ((("Connection", "close"),) if close else ()): self.send_header(k, v)
+        self.end_headers()
+        if close: self.close_connection = True
+        self.wfile.write(body); self.wfile.flush()
+
+    def carrier(self, px):
+        """Which header carried this run's token: the key header, or Authorization: Bearer; None when neither did."""
+        v = self.headers.get(px.key_header)
+        if v is not None and secrets.compare_digest(v.strip().encode("utf-8", "replace"), px.token.encode()): return px.key_header
+        a = self.headers.get("Authorization") or ""
+        if a[:7].lower() == "bearer " and secrets.compare_digest(a[7:].strip().encode("utf-8", "replace"), px.token.encode()): return "Authorization"
+        return None
+
+    def serve(self):
+        px, client = self.server.proxy, self.client_address[1]
+        path, query = urllib.parse.urlsplit(self.path).path, urllib.parse.urlsplit(self.path).query
+        carried = self.carrier(px)
+        if carried is None:
+            px.log(path, None, 401, None, None, client, "auth")
+            return self.error(401, "authentication_error", "not this run's token")
+        if not px.allows(path):  # the real key goes to the paths on the list and nowhere else: refused before the body is read, nothing forwarded
+            px.log(path, None, 403, None, None, client, "path")
+            return self.error(403, "permission_error", f"path {path} is not on [auth] paths")
+        if px.sealed:
+            px.log(path, None, 402, None, None, client, "ended")
+            return self.error(402, "billing_error", "the run has ended")
+        if self.headers.get("Transfer-Encoding"): return self.error(411, "invalid_request_error", "Content-Length is required")
+        try: n = int(self.headers.get("Content-Length") or 0)
+        except ValueError: n = -1
+        if not 0 <= n <= MAX_BODY: return self.error(400 if n < 0 else 413, "invalid_request_error", "bad Content-Length" if n < 0 else "request body too large")
+        body = self.rfile.read(n) if n else b""  # exactly Content-Length bytes
+        if len(body) < n: self.close_connection = True; return
+        model = None
+        if is_messages(path):
+            try: j = json.loads(body); model = j.get("model") if isinstance(j, dict) and isinstance(j.get("model"), str) else None
+            except ValueError: pass
+            wall, call = px.wall()
+            if wall:
+                px.log(path, model, 402, None, None, client, "budget")
+                self.error(402, "billing_error", wall, close=False)
+                if call: px.on_wall(f"killed: {wall}")  # the first refusal stops the run, once the refusal is on its way
+                return
+        # forward: the same method, path, query and body; the same headers but the host, the key and the hop-by-hop ones
+        heads = {}
+        for k, v in self.headers.items():
+            if is_hop(k) or k.lower() in ("host", "content-length", px.key_header.lower(), "authorization", "accept-encoding"): continue
+            heads[k] = f"{heads[k]}, {v}" if k in heads else v
+        heads["Host"] = px.host_header
+        heads["Authorization" if carried == "Authorization" else px.key_header] = ("Bearer " if carried == "Authorization" else "") + px.real_key()
+        conn = px.connect()
+        px.begin(conn)
+        try:
+            try:
+                conn.request(self.command, px.base + path + ("?" + query if query else ""), body=body or None, headers=heads)
+                resp = conn.getresponse()
+            except (OSError, http.client.HTTPException) as x:
+                px.log(path, model, 502, None, None, client, None)
+                return self.error(502, "api_error", f"the upstream did not answer ({type(x).__name__})", close=False)
+            self.relay(px, conn, resp, path, model, client)
+        finally:
+            px.end(conn)
+
+    def relay(self, px, conn, resp, path, model, client):
+        ctype = (resp.getheader("Content-Type") or "").lower()
+        meter = Meter(ctype.startswith("text/event-stream")) if is_messages(path) and resp.status == 200 else None
+        chunked = resp.status not in (204, 304) and resp.status >= 200
+        self.send_response_only(resp.status, resp.reason)
+        for k, v in resp.getheaders():
+            if not is_hop(k) and k.lower() != "content-length": self.send_header(k, v)
+        if chunked: self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        booked = []
+
+        def book():  # once, and before the client can see the response end, so its next request meets a total that has this one in it
+            if booked: return
+            booked.append(1)
+            if meter: meter.finish()
+            px.record(path, model or (meter.model if meter else None), resp.status, meter.usage if meter else None, client)
+
+        try:
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk: break
+                if meter: meter.feed(chunk)
+                if meter and meter.done: book()
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk) if chunked else chunk); self.wfile.flush()  # each piece goes on as it arrives
+            book()
+            if chunked: self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
+        except (OSError, http.client.HTTPException): self.close_connection = True  # the client went, or the upstream broke: what was seen is still booked
+        finally: book()
+
+    def do_all(self):
+        try: self.serve()
+        except (OSError, http.client.HTTPException): self.close_connection = True
+        except Exception as x:
+            self.close_connection = True
+            self.server.proxy.log(urllib.parse.urlsplit(self.path).path, None, 500, None, None, self.client_address[1], f"error {type(x).__name__}")
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_all
+
+
+class KeyProxy:
+    """One door to the API for one run. It holds the real key, answers only to the run's token, forwards each request, relays the response as it arrives, prices
+    what passes at the [prices] rates, keeps a line per request in proxy.jsonl, and refuses further /v1/messages requests once its total reaches the budget."""
+
+    def __init__(self, key, key_header, upstream, timeout, prices, budget, log_path, paths=None):
+        self._key = key  # the one place the key lives
+        self.paths = {self.trim(p) for p in (DEFAULT_CONFIG["auth"]["paths"] if paths is None else paths)}
+        self.token = f"{NAME}-{secrets.token_urlsafe(24)}"  # 32 characters after the prefix; new for every run
+        self.key_header = key_header or "x-api-key"
+        u = urllib.parse.urlsplit(upstream)
+        self.https, self.host, self.up_port, self.base = u.scheme == "https", u.hostname, u.port or (443 if u.scheme == "https" else 80), u.path.rstrip("/")
+        self.host_header = u.hostname + (f":{u.port}" if u.port else "")
+        self.timeout, self.prices, self.budget = timeout, prices, budget
+        self.lock, self.cv = threading.Lock(), threading.Condition()
+        self.total, self.usage, self.requests, self.refused, self.unpriced = 0.0, {}, 0, 0, set()
+        self.sealed = self.closed = self.frozen = self.serving = self.walled = False
+        self.on_wall, self.wall_called, self.active, self.conns, self.clients = None, False, 0, set(), set()
+        self.log_file = open(log_path, "w", encoding="utf-8")
+        self.server = ProxyServer(("127.0.0.1", 0), ProxyHandler)
+        self.server.proxy = self
+        self.port = self.server.server_address[1]
+        self.ctx = ssl.create_default_context() if self.https else None
+
+    def __repr__(self): return f"KeyProxy(127.0.0.1:{self.port})"  # never the key
+
+    def real_key(self): return self._key
+
+    @staticmethod
+    def trim(path): return path[:-1] if len(path) > 1 and path.endswith("/") else path  # one trailing slash
+
+    def allows(self, path):
+        """Whether the request's path (the query already dropped) equals an entry of [auth] paths: exactly, so /v1/messages/../complete and /v1/messages;x are not on the list."""
+        return self.trim(path) in self.paths
+
+    def start(self):
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start(); self.serving = True
+
+    def connect(self):
+        return (http.client.HTTPSConnection(self.host, self.up_port, timeout=self.timeout, context=self.ctx) if self.https
+                else http.client.HTTPConnection(self.host, self.up_port, timeout=self.timeout))
+
+    def client_up(self, sock):
+        with self.cv: self.clients.add(sock)
+
+    def client_down(self, sock):
+        with self.cv: self.clients.discard(sock)
+
+    def begin(self, conn):
+        with self.cv: self.active += 1; self.conns.add(conn)
+
+    def end(self, conn):
+        try: conn.close()
+        except OSError: pass
+        with self.cv: self.active -= 1; self.conns.discard(conn); self.cv.notify_all()
+
+    def wall(self):
+        """(the refusal text, whether to call the runner's stop): the text is None while the total is under the budget; the stop is called on the first refusal only."""
+        with self.lock:
+            if not self.walled: return None, False
+            call = self.on_wall is not None and not self.wall_called
+            if call: self.wall_called = True
+            return f"budget {money(self.budget)} reached at ${self.total:.4f} true", call
+
+    def log(self, path, model, status, usage, cost, client, refused):
+        with self.lock:
+            if self.frozen: return
+            if refused is None: self.requests += 1
+            else: self.refused += 1
+            self.write(path, model, status, usage, cost, client, refused)
+
+    def write(self, path, model, status, usage, cost, client, refused):
+        self.log_file.write(json.dumps({"t": datetime.datetime.now().isoformat(timespec="milliseconds"), "path": path, "model": model, "status": status, "usage": usage,
+                                        "cost": None if cost is None else round(cost, 6), "total": round(self.total, 6), "client": client, "refused": refused}) + "\n")
+        self.log_file.flush()
+
+    def record(self, path, model, status, usage, client):
+        """One forwarded request, answered: price its usage, add it to the total under the lock, write its line."""
+        cost = None
+        with self.lock:
+            if self.frozen: return
+            if usage is not None:
+                acc = self.usage.setdefault(model or "unknown", {"in": 0, "cache_write": 0, "cache_read": 0, "out": 0, "searches": 0})
+                for k in acc: acc[k] += usage[k]
+                cost = model_cost(self.prices, model, usage) if model else None
+                if cost is None: self.unpriced.add(model or "unknown")
+                else:
+                    self.total += cost
+                    if self.total >= self.budget - 1e-12: self.walled = True
+            self.requests += 1
+            self.write(path, model, status, usage, cost, client, None)
+
+    def seal(self):
+        """The run's CLI has ended: from now on every request is refused, so what is booked is all there will be."""
+        self.sealed = True
+
+    def drain(self, wait=3.0):
+        """Wait for the requests in flight to be booked; one still open after the wait is cut (what it carried so far is booked by its handler)."""
+        with self.cv:
+            self.cv.wait_for(lambda: self.active == 0, timeout=wait)
+            stuck = list(self.conns)
+        for c in stuck:
+            try:
+                if c.sock: c.sock.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+        if stuck:
+            with self.cv: self.cv.wait_for(lambda: self.active == 0, timeout=2.0)
+
+    def freeze(self):
+        """No more lines and no more money: the log is closed so the receipt can hash it."""
+        with self.lock:
+            self.frozen = True
+            try: self.log_file.close()
+            except OSError: pass
+
+    def figures(self):
+        with self.lock: return {"cost": self.total, "usage": copy.deepcopy(self.usage), "requests": self.requests, "refused": self.refused, "unpriced": sorted(self.unpriced)}
+
+    def close(self):
+        """Stop serving, and cut every connection the run still holds: the token is worth nothing after this."""
+        if self.closed: return
+        self.sealed = self.closed = True
+        if self.serving: self.server.shutdown()
+        self.server.server_close()
+        with self.cv: socks = list(self.clients)
+        for s in socks:
+            try: s.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+        self.freeze()
+
+
+def read_key(P, cfg):
+    """The key, in the runner's hands before launch: the adapter's key variable in the runner's own environment, else the first line printed by [auth] key_command."""
+    k = os.environ.get(P.ad["key_env"], "").strip()
+    if not k:
+        cmd = cfg["auth"]["key_command"].strip()
+        if not cmd: raise Refused(f"auth: no key: export {P.ad['key_env']} for the runner, or set [auth] key_command")
+        try: r = subprocess.run(cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, timeout=30)  # outside the fence; its stderr is the terminal's
+        except (OSError, subprocess.TimeoutExpired) as x: raise Refused(f"auth: [auth] key_command could not be run ({type(x).__name__})")
+        if r.returncode != 0: raise Refused(f"auth: [auth] key_command exited {r.returncode}")
+        k = (r.stdout.splitlines() or [""])[0].strip()
+        if not k: raise Refused("auth: [auth] key_command printed no key on its first line")
+    if not re.fullmatch(r"[\x21-\x7e]+", k): raise Refused("auth: the key has a character that cannot go in a header")
+    return k
 
 
 # ---- the run -------------------------------------------------------------------------------------------------------------------
@@ -811,6 +1214,138 @@ def kill_group(proc):  # the whole group: the CLI's own tool processes die with 
     except (ProcessLookupError, PermissionError, OSError):
         try: proc.kill()
         except OSError: pass
+
+
+# ---- the kill walk: nothing the run started outlives it ------------------------------------------------------------------------------
+
+PS = "/bin/ps"  # absolute, like SANDBOX_EXEC: the one external command the walk uses, and its failure is a note, never a crash
+WALK_EVERY = 2.0  # seconds between looks at the process table while the CLI lives
+WALK_ROUNDS, WALK_GAP = 5, 0.2  # a kill is repeated up to this many times, this many seconds apart, until nothing of the run is alive
+EXIT_WAIT = 3.0  # seconds the read loop waits for the CLI's pipe after the CLI has exited: an orphan can hold it open
+
+
+PS_ROW = re.compile(r"^\s*(\d+)\s+\S+\s+\d+:\d\d(?::\d\d)?(?:\.\d+)?(?:\s|$)")  # the start of a row of `ps -E -A`: pid, tty, cpu time
+
+
+def ps_table():
+    """{pid: (ppid, alive)} for every process, from `ps -A -o pid=,ppid=,stat=`, or None when ps cannot be read. A zombie is not alive: it is dead and waiting to be reaped."""
+    try: r = subprocess.run([PS, "-A", "-o", "pid=,ppid=,stat="], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError, ValueError): return None
+    if r.returncode != 0: return None
+    table = {}
+    for ln in r.stdout.splitlines():
+        f = ln.split()
+        if len(f) >= 2 and f[0].isdigit() and f[1].isdigit(): table[int(f[0])] = (int(f[1]), not (len(f) > 2 and f[2].startswith("Z")))
+    return table or None
+
+
+def ps_marked(markers):
+    """The pids of this user's processes whose environment holds every marker (NAME=value), from `ps -E -A -ww`, or None when ps cannot be read.
+    Each line is tested and dropped: an environment is never kept, logged or written, only the pid of a match."""
+    pats = [re.compile(r"(?:^|\s)" + re.escape(m) + r"(?:\s|$)") for m in markers]
+    try: r = subprocess.run([PS, "-E", "-A", "-ww"], stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError, ValueError): return None
+    if r.returncode != 0: return None
+    found, pid, rec = set(), None, []
+
+    def close():
+        if pid is not None and all(p.search("\n".join(rec)) for p in pats): found.add(pid)
+    rows = r.stdout.splitlines()
+    shaped = any(PS_ROW.match(ln) for ln in rows)  # a ps whose rows are not shaped so is read a line to a row, the pid its first word
+    for ln in rows:  # a row is `PID TTY TIME CMD...`; an environment value with a newline in it continues the row on the next line
+        m = PS_ROW.match(ln) if shaped else re.match(r"^\s*(\d+)\s", ln)
+        if m: close(); pid, rec = int(m.group(1)), [ln]
+        elif shaped: rec.append(ln)
+    close()
+    return found
+
+
+def run_markers(env, ad):
+    """What the run's environment holds that no other process's does: its temp root, which is in the run's own folder; for an adapter with none, its config directory and its API address.
+    A process that scrubbed its environment and was re-parented to launchd before a look found it carries no marker and is beyond this walk."""
+    if ad["tmp_env"] and env.get(ad["tmp_env"]): return [f"{ad['tmp_env']}={env[ad['tmp_env']]}"]
+    return [f"{k}={env[k]}" for k in (ad["config_dir_env"], ad["base_url_env"]) if k and env.get(k)]
+
+
+class Walk:
+    """The run's processes: every descendant of the CLI, found by ancestry while the CLI lives and again after it has gone, and every process of this user whose
+    environment carries the run's marker. kill() ends them all and does not return until none is alive or five rounds have not killed them."""
+
+    def __init__(self, proc, markers, notes):
+        self.proc, self.markers, self.notes = proc, markers, notes
+        self.pids, self.outlived, self.stuck = set(), set(), set()  # pids of the run's processes; those that outlived the CLI; those a kill was not permitted to reach
+        self.lock, self.said = threading.RLock(), False  # a stop can come from the timer, the proxy's thread or the read loop
+
+    def say(self, text):
+        if not self.said: self.said = True; self.notes.append(text)  # once: ps failing is one fact, not one note per look
+
+    def look(self, env=False):
+        """One look at the process table: add every descendant of the CLI (while it lives) and of every process already in the set; with env, add every process carrying the
+        marker. Returns the table, or None when ps could not be read (the set is then left as it was)."""
+        with self.lock:
+            marked = ps_marked(self.markers) if env and self.markers else set()  # read first: the table below is then the newer of the two
+            t = ps_table()
+            if t is None or marked is None:
+                self.say(f"{PS} could not be read: a process the CLI started and detached may have outlived it, and the walk could only kill the ones it had already seen")
+                return None
+            self.pids = {p for p in self.pids if t.get(p, (0, False))[1]}  # one that is gone is gone; its number may be somebody else's by now
+            kids = {}
+            for pid, (pp, _) in t.items(): kids.setdefault(pp, []).append(pid)
+            cli = self.proc.poll() is None and self.proc.pid in t  # the CLI's number is its own only while it lives
+            todo = sorted(self.pids | ({self.proc.pid} if cli else set()))
+            seen = set(todo)
+            while todo:
+                for k in kids.get(todo.pop(), ()):
+                    if k not in seen: seen.add(k); todo.append(k)
+            self.pids |= (seen | marked) - {self.proc.pid, os.getpid(), 0, 1}
+            self.pids = {p for p in self.pids if p in t and t[p][1]}  # a marked pid the newer table does not list is dead
+            return t
+
+    @staticmethod
+    def pgid(pid):
+        try: return os.getpgid(pid)
+        except OSError: return None
+
+    def alive(self, t):
+        if t is not None: return {p for p in self.pids if t.get(p, (0, False))[1]}
+        live = set()  # no table: ask each pid directly (a zombie counts as alive here)
+        for p in self.pids:
+            try: os.kill(p, 0); live.add(p)
+            except PermissionError: live.add(p)
+            except OSError: pass
+        return live
+
+    def sigkill(self, pids):
+        for p in sorted(pids):
+            if p <= 1 or p == os.getpid(): continue
+            try: os.kill(p, signal.SIGKILL)
+            except ProcessLookupError: pass
+            except OSError: self.stuck.add(p)  # PermissionError: not this user's, or protected
+
+    def group(self, cli, members):
+        # the CLI's group exists while it lives or while one of its members does; after that its number may belong to a process that is not the run's
+        if (cli or any(self.pgid(p) == self.proc.pid for p in members)) and self.proc.pid != os.getpgrp(): kill_group(self.proc)
+
+    def kill(self):
+        """Look, SIGKILL every pid in the set, kill the CLI's group, then look again: up to five times, 200 ms apart, until nothing in the set is alive; a pid still alive after that,
+        or one that may not be killed, is named in a note. A process counts as outlived when it was alive at the first look, or at a later one, and the group kill alone would not have
+        reached it: outside the CLI's group while the CLI lives, any at all once the CLI has gone. The first look reads the marker too: a program whose launcher has already exited is in
+        no one's ancestry, and a look by ancestry alone passed one over live, killed it in the rounds and counted nothing (14 October 2026)."""
+        with self.lock:
+            cli = self.proc.poll() is None
+            alive = self.alive(self.look(env=True))
+            self.outlived |= {p for p in alive if not cli or self.pgid(p) not in (None, self.proc.pid)}
+            self.sigkill(alive); self.group(cli, alive)
+            killed, alive = cli or bool(alive), set()
+            if killed:  # something was killed: look again until nothing is left
+                for i in range(WALK_ROUNDS + 1):
+                    alive = self.alive(self.look(env=True)) - self.stuck
+                    self.outlived |= {p for p in alive if self.pgid(p) not in (None, self.proc.pid)}  # the CLI's group has had its kill by now: what is alive outside it was not reached by it
+                    if not alive or i == WALK_ROUNDS: break
+                    self.sigkill(alive); self.group(False, alive); time.sleep(WALK_GAP)
+            for p in sorted(alive | self.stuck):
+                self.notes.append(f"could not kill process {p}: " + ("not permitted" if p in self.stuck else f"still alive after {WALK_ROUNDS} rounds"))
+            self.stuck = set()
 
 
 def acquire_lock(path):
@@ -828,9 +1363,25 @@ def probe(P, args):
 
 
 def execute(P, cfg):
-    ad, run, d = P.ad, P.run, P.dirs[0]
-    os.makedirs(run + "/tmp" if ad["tmp_env"] else run, mode=0o700)
+    """Takes the key, makes the run's folders, starts the key proxy where the adapter has one, runs the CLI, and closes the proxy on every way out."""
+    key = read_key(P, cfg) if P.proxy_on else None  # before anything is made: a run with no key leaves no folder
+    os.makedirs(P.run + "/tmp" if P.ad["tmp_env"] else P.run, mode=0o700)
     os.makedirs(P.config_dir, mode=0o700, exist_ok=True)
+    if not P.proxy_on: return run_cli(P, cfg, None)
+    proxy, old_term = None, signal.signal(signal.SIGTERM, on_term)  # SIGTERM and ^C end in the finally below, which closes the door
+    try:
+        proxy = KeyProxy(key, P.ad["key_header"], P.upstream, P.upstream_timeout, cfg["prices"], P.budget, os.path.join(P.run, PROXY_LOG), P.paths)
+        key = None  # the proxy holds it now
+        P.env[P.ad["key_env"]], P.env[P.ad["base_url_env"]] = proxy.token, f"http://127.0.0.1:{proxy.port}"
+        proxy.start()
+        return run_cli(P, cfg, proxy)
+    finally:
+        if proxy: proxy.close()
+        signal.signal(signal.SIGTERM, old_term)
+
+
+def run_cli(P, cfg, proxy):
+    ad, run, d = P.ad, P.run, P.dirs[0]
     with open(f"{run}/brief.md", "w", encoding="utf-8") as f: f.write(P.brief)
     with open(P.sb_path, "w", encoding="utf-8") as f: f.write(P.profile)
     notes = list(P.notes)
@@ -855,7 +1406,8 @@ def execute(P, cfg):
     elif version not in P.measured: notes.append(f"CLI {version}, not one of {', '.join(P.measured) or 'none'} that the adapter was measured on: the command shape, the auth finding and any factor may differ")
 
     with open(f"{run}/command.txt", "w", encoding="utf-8") as f:
-        f.write(shlex.join([SANDBOX_EXEC, "-f", P.sb_path] + P.shown) + "\n" + "environment: " + ", ".join(sorted(P.env)) + f"\ncli: {version}\n")
+        f.write(shlex.join([SANDBOX_EXEC, "-f", P.sb_path] + P.shown) + "\n" + "environment: " + ", ".join(sorted(P.env)) + f"\ncli: {version}\n"
+                + (f"auth: proxy 127.0.0.1:{proxy.port}\n" if proxy else ""))
     feed = PARSERS[ad["output"]]
     st = new_state(P.model)
     killed = [None]
@@ -865,8 +1417,13 @@ def execute(P, cfg):
         proc = subprocess.Popen(P.argv, stdin=subprocess.PIPE if ad["brief"] == "stdin" else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=er, text=True,
                                 encoding="utf-8", errors="replace", cwd=d, env=P.env, start_new_session=True)
 
+        walk = Walk(proc, run_markers(P.env, ad), notes)  # the run's processes: what the CLI starts is killed with it, in its group or out of it
+        swept = [False]  # the walk's kill after the CLI's own exit has run
+
         def stop(kind, text):
-            if killed[0] is None: killed[0] = (kind, text); kill_group(proc)
+            if killed[0] is None: killed[0] = (kind, text); walk.kill()  # every pid in the set, then the group, then the walk again
+
+        if proxy: proxy.on_wall = lambda text: stop("budget", text)  # the proxy's first refusal at the wall kills the run, as the streamed stop does
 
         if ad["brief"] == "stdin":
             def feed_stdin():
@@ -876,17 +1433,37 @@ def execute(P, cfg):
         timer = threading.Timer(P.timeout, lambda: stop("timeout", f"timeout {P.timeout}s")); timer.daemon = True; timer.start()  # time is kept by a timer, always
         grace = None
         checked = False
+        lines = queue.Queue()  # the CLI's output is read on a thread of its own: an orphan holding the pipe open must not hold the loop
+
+        def pump():
+            try:
+                for ln in proc.stdout: lines.put(ln)
+            except (OSError, ValueError): pass
+            lines.put(None)
+        threading.Thread(target=pump, daemon=True).start()
+        gone, look_at = None, time.monotonic() + WALK_EVERY
         try:
-            for line in proc.stdout:
+            while True:
+                now = time.monotonic()
+                if proc.poll() is not None:
+                    if gone is None:  # the CLI has exited, on its own or killed: no more requests of its own, so the door shuts, and the walk runs
+                        gone = now
+                        if proxy: proxy.seal()
+                        walk.kill(); swept[0] = True
+                    elif now - gone > EXIT_WAIT: break  # whatever still holds the pipe is not waited for
+                elif now >= look_at: walk.look(); look_at = time.monotonic() + WALK_EVERY  # the CLI's descendants, before a parent exits and they are orphans
+                try: line = lines.get(timeout=0.2)
+                except queue.Empty: continue
+                if line is None: break
                 ev.write(line); ev.flush()
                 try: e = json.loads(line)
                 except ValueError: continue
                 if not isinstance(e, dict): continue
                 feed(st, e, ad)
-                if P.require_key and ad["key_sources_ok"] and st["init"] and not checked:
+                if P.require_key and P.key_sources and st["init"] and not checked:
                     checked = True
-                    if st["key_source"] not in ad["key_sources_ok"]:
-                        stop("key", f"killed: key source is {st['key_source']!r}, not one of {', '.join(ad['key_sources_ok'])}, so the run would not bill an API key"); break
+                    if st["key_source"] not in P.key_sources:
+                        stop("key", f"killed: key source is {st['key_source']!r}, not one of {', '.join(P.key_sources)}, so the run would not bill an API key"); break
                 if P.mode in ("stream", "turn"):  # the CLI has no budget flag: the budget is kept here, from the usage it streams
                     running = true_total(st["usage"], st["cli_costs"], cfg["prices"], cfg["factors"])[0]
                     if running >= P.budget:
@@ -898,12 +1475,21 @@ def execute(P, cfg):
                     running = true_total(st["usage"], st["cli_costs"], cfg["prices"], cfg["factors"])[0]
                     if running >= P.budget: stop("budget", f"killed: budget {money(P.budget)} reached at ${running:.4f} true"); break
         except KeyboardInterrupt: stop("interrupted", "killed: interrupted")
+        except BaseException:  # nothing the run started is left behind by a bug of ours
+            stop("error", "killed: error in the runner"); signal.signal(signal.SIGTERM, old_term); raise
         finally:
             timer.cancel()
             if grace: grace.cancel()
-            signal.signal(signal.SIGTERM, old_term)
-        try: proc.wait(timeout=30)
-        except subprocess.TimeoutExpired: kill_group(proc); proc.wait()
+        try:  # the CLI's output has ended: whatever still asks for the API is refused, so the figures below are the last; then the CLI's own end, and the walk after it
+            if proxy: proxy.seal()
+            try: proc.wait(timeout=30)
+            except subprocess.TimeoutExpired: walk.kill(); proc.wait()
+            if not swept[0]: walk.kill()
+        except KeyboardInterrupt:
+            stop("interrupted", "killed: interrupted"); walk.kill(); proc.wait()
+        finally: signal.signal(signal.SIGTERM, old_term)
+    if walk.outlived: notes.append(f"{len(walk.outlived)} processes outlived the CLI and were killed")
+    if proxy: proxy.drain(); proxy.freeze()  # requests in flight are booked or cut; the log is closed so the receipt can hash it
     mins = (datetime.datetime.now() - t0).total_seconds() / 60
 
     text = st["text"]
@@ -912,7 +1498,12 @@ def execute(P, cfg):
             with open(f"{run}/last-message.txt", encoding="utf-8") as f: text = f.read()
         except OSError: text = st["last_message"] or ""
     true, cost_notes = true_total(st["usage"], st["cli_costs"], cfg["prices"], cfg["factors"])
-    ceiling = killed[0] is not None and killed[0][0] in ("timeout", "interrupted") and not st["complete"]
+    pf = proxy.figures() if proxy else None
+    if pf:  # what left this machine for the API through the only door; a model with no price falls back to the CLI's own figure over its factor, and says so
+        extra, cost_notes = true_total({m: u for m, u in pf["usage"].items() if m in pf["unpriced"]}, st["cli_costs"], cfg["prices"], cfg["factors"])
+        true = round(pf["cost"] + extra, 4)
+        if pf["unpriced"]: cost_notes.append(f"the key proxy could not price {', '.join(pf['unpriced'])} (no price in [prices]): the budget wall did not count it")
+    ceiling = not pf and killed[0] is not None and killed[0][0] in ("timeout", "interrupted") and not st["complete"]
     if ceiling: true = max(true, P.budget); notes.append("usage was not reported before the run was killed: the ledger holds the budget as a ceiling, not a measured cost")
     notes += cost_notes + factor_notes(st["usage"], st["cli_costs"], cfg["prices"], cfg["factors"], version)
     stream_cost = None
@@ -925,9 +1516,11 @@ def execute(P, cfg):
                          + (" alone, not by the streamed stop" if not st["usage_events"] else " and by the streamed stop on the rest"))
         unp = unpriced_models(streamed, cfg["prices"])
         if unp: notes.append(f"the streamed stop could not count {', '.join(unp)}: no price in [prices]; only the CLI's flag at budget x factor stopped it, so that stop is approximate")
-        if killed[0] and killed[0][0] == "budget" and not st["complete"]:
+        if killed[0] and killed[0][0] == "budget" and not st["complete"] and not pf:  # through the key proxy the figure is what the API was asked for, not what streamed
             notes.append("killed before the CLI's result: the true cost is the usage streamed up to the kill, input and cache tokens at the [prices] rates and output tokens as the stream reported them "
                          "(a placeholder), so what was spent is higher and the CLI's own figure was never reported")
+    if pf and stream_cost is not None and abs(stream_cost - pf["cost"]) > 0.01 and abs(stream_cost - pf["cost"]) > 0.01 * max(stream_cost, pf["cost"]):
+        notes.append(f"stream ${stream_cost:.4f}, proxy ${pf['cost']:.4f}")
     if st["errors"]: notes.append("CLI errors: " + "; ".join(st["errors"][:3]))
     if st["text_is_last_message"]: notes.append("the CLI's result carried no text: result.md holds the model's last message from the stream")
     if P.mode == "turn": notes.append("budget checked when each turn ends, not while a turn runs (--soft-budget)")
@@ -954,8 +1547,9 @@ def execute(P, cfg):
     cli = st["cli_total"]
     summary = {"status": status, "run": run, "dir": d, "reads": P.reads, "readonly": P.readonly, "adapter": P.adapter, "model": P.model, "effort": P.effort, "turns": st["turns"],
                "minutes": round(mins, 1), "budget": P.budget, "cli_cost": cli, "true_cost": true, "stream_cost": stream_cost, "true_cost_is_ceiling": ceiling, "tokens_in": tin, "tokens_out": tout,
-               "key_source": st["key_source"], "session_id": st["session"], "denials": st["denials"], "exit": proc.returncode, "cli_version": version,
-               "prices_read_on": str(cfg["prices"].get("read_on") or ""), "contract": contract, "out": out_path, "notes": notes}
+               "key_source": st["key_source"], "session_id": st["session"], "denials": st["denials"], "exit": proc.returncode, "outlived": len(walk.outlived), "cli_version": version,
+               "prices_read_on": str(cfg["prices"].get("read_on") or ""), "contract": contract, "out": out_path, "notes": notes,
+               "proxy_cost": round(pf["cost"], 6) if pf else None, "proxy_requests": pf["requests"] if pf else None, "proxy_refused": pf["refused"] if pf else None}
     with open(f"{run}/summary.json", "w", encoding="utf-8") as f: json.dump(summary, f, indent=1)
     clean = lambda s: re.sub(r"[|\r\n]+", "/", str(s))
     tcost = f"true ${true:.4f}" + (" (ceiling, usage unreported)" if ceiling else "")
@@ -974,7 +1568,7 @@ def execute(P, cfg):
             if m: previous = m.group(1)
         body = receipt_bytes({"receipt": 1, "tool": f"{NAME} {VERSION}", "run": os.path.basename(run), "started": t0.isoformat(timespec="seconds"),
                               "ended": datetime.datetime.now().isoformat(timespec="seconds"), "status": clean(status),
-                              "files": {n: sha256_file(f"{run}/{n}") for n in RECEIPT_FILES}, "ledger_before": hashlib.sha256(held).hexdigest(), "previous": previous})
+                              "files": {n: sha256_file(f"{run}/{n}") for n in RECEIPT_FILES + ((PROXY_LOG,) if proxy else ())}, "ledger_before": hashlib.sha256(held).hexdigest(), "previous": previous})
         with open(f"{run}/receipt.json", "wb") as f: f.write(body)
         receipt = hashlib.sha256(body).hexdigest()
     except OSError as x: notes.append(f"no receipt written ({x}): the ledger line carries none")  # the money is spent: the line is still booked, or the cap would not count it
@@ -997,6 +1591,7 @@ def parse_args(argv):
     add = a.add_argument
     add("--dir", help="the run's folder: writable unless --readonly, the CLI works in it (required unless --verify)")
     add("--verify", nargs="?", const=True, metavar="RUN", help="check the ledger's receipts, or one run folder's files against its receipt; runs nothing")
+    add("--expect", metavar="HASH", help="with --verify: fail unless the last receipt on the ledger is this hash (keep it somewhere the ledger's writer cannot reach)")
     add("--read", action="append", default=[], help="a folder the run may read, repeatable")
     add("--readonly", action="store_true", help="the run's folder is readable only")
     add("--adapter", help="which CLI adapter: claude, codex, or one declared in config.toml (default from config)")
@@ -1017,6 +1612,7 @@ def parse_args(argv):
     add("--version", action="version", version=f"{NAME} {VERSION}")
     o = a.parse_args(argv)
     if not o.dir and not o.verify: a.error("--dir is required")
+    if o.expect is not None and o.verify is not True: a.error("--expect goes with --verify alone: it checks the ledger's last receipt, not a run folder")
     return o
 
 
@@ -1026,7 +1622,7 @@ def main(argv=None):
         if sys.platform == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
         home = derive_home()
         siwithin_home = real(o.home) if o.home else os.path.join(home, ".config", NAME)
-        if o.verify: return verify_ledger(siwithin_home) if o.verify is True else verify_folder(o.verify)  # no lock, no config
+        if o.verify: return verify_ledger(siwithin_home, o.expect) if o.verify is True else verify_folder(o.verify)  # no lock, no config
         cfg, cfg_path, present, problems = load_config(siwithin_home)
         brief = sys.stdin.read() if (sys.stdin is not None and not sys.stdin.isatty()) else None
         now = datetime.datetime.now()

@@ -17,10 +17,17 @@ write_home = ["Library/Caches", "Library/Logs"]  # home-relative paths a run may
 config_write = ["projects", "sessions", "session-env", "shell-snapshots", "file-history", "todos", "tasks", "debug", "statsig", "telemetry", "cache", "state", "logs", "paste-cache", "history.jsonl", ".last-cleanup"]  # paths inside the CLI's config directory a run may write, its state; the rest of that directory, settings, memory, skills, plugins and a key helper included, stays as the owner left it
 rc_files = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout", ".bash_profile", ".bash_login", ".bashrc", ".profile"]  # home-relative shell files a run may read; list files these source in read_home
 deny_write = ["/private/tmp", "/tmp", "/opt", "/usr/local", "/Applications", "/Library", "/Volumes"]  # roots outside the home where writes are refused
-deny_exec = ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay"]  # programs a run may not start
+deny_exec = ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay", "/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch"]  # programs a run may not start, by path: a copy of one elsewhere is not stopped
 
 [env]
 pass = ["HOME", "PATH", "USER", "TMPDIR", "LANG", "SHELL", "TERM"]  # variables copied into the run's environment by name; nothing else is inherited
+
+# The key proxy, for adapters whose auth is "proxy": the runner keeps the key and the run gets a token and a loopback address.
+[auth]
+key_command = ""                          # a command the runner runs outside the fence when the adapter's key variable is not set in its own environment; its first line of output is the key
+upstream = "https://api.anthropic.com"    # where the proxy sends each request, with the real key; https, or http for a loopback host
+upstream_timeout = 600                    # seconds the proxy waits on the upstream for one request
+paths = ["/v1/messages", "/v1/messages/count_tokens"]  # the only paths the proxy forwards with the real key (query and one trailing slash ignored); any other gets 403 and goes nowhere
 
 # Dollars per million tokens, as [input, cache write, cache read, output], keyed by the model id the CLI reports. Cache writes are priced at the 5-minute rate.
 # Rates above a model's first tier are not here (a Haiku 5.5 prompt over 100,000 tokens, a long-context or fast tier at OpenAI): a run that uses them is understated.
@@ -50,8 +57,12 @@ config_dir_env = "CLAUDE_CONFIG_DIR"                 # the variable that points 
 tmp_env = "CLAUDE_CODE_TMPDIR"                       # the variable that moves the CLI's temp root into the run's folder ("" if it has none)
 read_home = [".local/bin", ".local/share/claude"]    # home-relative paths a run of this CLI may read, besides the folder of its binary
 write_home = []                                      # home-relative paths a run of this CLI may write
-env_pass = ["ANTHROPIC_API_KEY"]                     # variables copied into this CLI's environment by name, on top of [env] pass
-output = "claude-stream-json"                        # how to read the CLI's output: claude-stream-json or codex-jsonl
+env_pass = []                                        # variables copied into this CLI's environment by name, on top of [env] pass
+auth = "proxy"                                       # proxy: the key stays in the runner and the run gets a token (see [auth]); env: the key is in the run's environment, as in 0.2.1
+key_env = "ANTHROPIC_API_KEY"                        # the variable the run reads its key from: the token under proxy; the runner's own key variable, passed on under env
+base_url_env = "ANTHROPIC_BASE_URL"                  # the variable that points the CLI at the proxy's address (proxy only)
+key_header = "x-api-key"                             # the header the CLI sends its key in (proxy only; Authorization: Bearer is accepted too)
+output = "claude-stream-json"                       # how to read the CLI's output: claude-stream-json or codex-jsonl
 usage_at = "message"                                 # when usage reaches the runner: message, turn or end. With a budget flag, message adds a second stop: the runner kills the run at the true budget
 input_includes_cached = false                        # whether the CLI's input token count already includes cached tokens (codex-jsonl only)
 brief = "stdin"                                      # how the brief is passed: stdin or arg
@@ -111,7 +122,11 @@ tmp_env = ""                                         # the CLI has no temp-root 
 read_home = []                                       # install location unconfirmed: the folder of the binary found on PATH is added at run time
 write_home = []                                      # home-relative paths a run of this CLI may write
 env_pass = ["CODEX_API_KEY"]                         # variables copied into this CLI's environment by name, on top of [env] pass
-output = "codex-jsonl"                               # how to read the CLI's output: claude-stream-json or codex-jsonl
+auth = "env"                                         # the proxy serves the first adapter only in this release: the key is in the run's environment
+key_env = "CODEX_API_KEY"                            # the variable that carries the key
+base_url_env = ""                                    # none: the CLI is not pointed at a proxy
+key_header = ""                                      # none
+output = "codex-jsonl"                              # how to read the CLI's output: claude-stream-json or codex-jsonl
 usage_at = "turn"                                    # usage appears only on turn.completed, so the budget is checked when a turn ends
 input_includes_cached = true                         # unconfirmed: the docs do not say whether input_tokens includes cached_input_tokens; the sample numbers suggest it
 brief = "stdin"                                      # how the brief is passed: stdin or arg
