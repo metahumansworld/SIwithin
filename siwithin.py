@@ -40,8 +40,11 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
+LOG_BIN = "/usr/bin/log"  # absolute, like SANDBOX_EXEC: reads the kernel's sandbox report for the run's network mark once the run has ended; a module constant, so a test can stand a shim in
+LOG_WAIT = 2.0  # seconds between the CLI's end and each of the two reads of that report: the kernel coalesces repeated reports and lands its "N duplicate reports" line up to about two seconds after the first, seen live on 15 October 2026, so the report is read twice, LOG_WAIT apart, and the second read's figures stand
+NET_MODES = ("proxy", "report", "open")  # [fence] network: only the key proxy's port; open and every socket reported; open and unreported
 UNCONFIRMED = "unconfirmed"  # an adapter field holding this is a stub: any option that needs it is refused, naming the field
 ROADMAP = "README.md, 'What v0.1 does not do'"
 PROXY_TAG = "SIwithin"  # the name the key proxy's error bodies carry; change it with NAME
@@ -66,6 +69,7 @@ DEFAULT_CONFIG = {
     "defaults": {"adapter": "claude", "budget": 5.0, "turns": 40, "timeout": 2700},
     "never": {"folders": []},
     "fence": {
+        "network": "proxy",  # the run's sockets: proxy (the key proxy's loopback port and no other, DNS included), report (open, every socket reported: a survey), open (unreported)
         "read_home": ["Library/Caches", "Library/Logs", "Library/Keychains", "Library/Python", ".gitconfig", ".config/git"],
         "write_home": ["Library/Caches", "Library/Logs"],
         "config_write": ["projects", "sessions", "session-env", "shell-snapshots", "file-history", "todos", "tasks", "debug", "statsig", "telemetry", "cache", "state", "logs", "paste-cache", "history.jsonl", ".last-cleanup"],
@@ -533,6 +537,7 @@ SB_TEMPLATE = """(version 1)
 @ALLOW_WRITE@
 ; no opening of apps, screenshots or scripting of the machine from inside the run
 @DENY_EXEC@
+@NETWORK@
 """
 
 
@@ -559,6 +564,72 @@ def ancestors(p, home):
     return out
 
 
+PROXY_PORT = "@PROXY_PORT@"  # in the profile until the key proxy has a port: a real run fills it in before launch, a dry run prints <port>
+
+
+def net_mark(run): return f"{NAME}-net:{os.path.basename(run)}"  # the text each of the run's network lines carries in the kernel's log, so the report is read by it and nothing else
+
+
+def network_rules(mode, run):
+    """The profile's network lines for [fence] network. A later rule wins, so the proxy's allow sits after the deny."""
+    mark = sb_str(net_mark(run))
+    if mode == "proxy":
+        return ("; the network: every socket is refused, DNS included, but the key proxy's loopback port; each refusal is reported to the kernel's log under this run's mark\n"
+                f"(deny network* (with message {mark}))\n(allow network-outbound (remote ip \"localhost:{PROXY_PORT}\"))")
+    if mode == "report":
+        return ("; the network: open; every socket the run opens is reported to the kernel's log under this run's mark, a survey and not a wall\n"
+                f"(allow (with report) network* (with message {mark}))")
+    if mode == "open": return "; the network: open and unreported ([fence] network = \"open\")"
+    raise Refused(f"[fence] network must be one of {', '.join(NET_MODES)}, not {mode!r}")
+
+
+SANDBOX_LINE = re.compile(r"^(?:(\d+) duplicate reports? for )?Sandbox: (.+?)\((\d+)\) (deny\(\d+\)|allow) (network-[a-z*-]+) (.*)$")  # one of the kernel's sandbox report lines; a coalesced one counts itself and its duplicates
+
+
+def read_sandbox_report(mark, start, end):
+    """The kernel's sandbox report lines that carry the mark, between the two times, read from the unified log: a list of event messages. Raises OSError when the log cannot be read."""
+    fmt = lambda t: t.strftime("%Y-%m-%d %H:%M:%S")
+    try: r = subprocess.run([LOG_BIN, "show", "--start", fmt(start), "--end", fmt(end), "--style", "ndjson", "--predicate", f'eventMessage CONTAINS "{mark}"'], capture_output=True, text=True, timeout=300)
+    except (subprocess.SubprocessError, OSError) as x: raise OSError(f"{LOG_BIN} show: {x}")
+    if r.returncode != 0: raise OSError(f"{LOG_BIN} show exit {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}")
+    out = []
+    for line in r.stdout.split("\n"):
+        try: j = json.loads(line)
+        except ValueError: continue
+        if isinstance(j, dict) and isinstance(j.get("eventMessage"), str): out.append(j["eventMessage"])
+    return out
+
+
+def network_figures(mode, mark, messages, cli_pid):
+    """What the kernel reported under the run's mark: refused (deny lines) and reported (allow lines), by target and by process, and split between the CLI's own pid and every other process under the run's profile: its children, and the version and auth probes that run before it.
+    Only a message whose second line is the mark counts: the log's own line about the read carries the mark in its arguments and is left out."""
+    fig = {"mode": mode, "mark": mark, "refused": 0, "reported": 0, "targets": {}, "processes": {}, "cli": 0, "others": 0, "unparsed": 0, "late": 0, "note": None}
+    for m in messages:
+        head, _, tail = m.partition("\n")
+        if tail.strip() != mark: continue
+        x = SANDBOX_LINE.match(head)
+        if not x: fig["unparsed"] += 1; continue
+        dup, name, pid, verdict, op, target = x.groups()
+        k = int(dup) if dup else 1  # a plain line is one report; a coalesced line, "N duplicate reports for ...", is the N the kernel suppressed after the plain one it logged: three refused connects were seen as one plain line and "2 duplicate reports"
+        kind = "refused" if verdict.startswith("deny") else "reported"
+        fig[kind] += k
+        t = f"{'deny' if kind == 'refused' else 'allow'} {op} {target}"
+        fig["targets"][t] = fig["targets"].get(t, 0) + k
+        p = f"{name}({pid})"
+        fig["processes"][p] = fig["processes"].get(p, 0) + k
+        fig["cli" if int(pid) == cli_pid else "others"] += k
+    return fig
+
+
+def network_line(n):
+    """The terminal's one line on the network, from the summary's figures."""
+    if n["mode"] == "open": return "network: open, unreported"
+    what = f"refused {n['refused']}" if n["mode"] == "proxy" else f"reported {n['reported']}"
+    top = sorted(n["targets"].items(), key=lambda kv: (-kv[1], kv[0]))[:6]
+    return (f"network: {n['mode']}, {what} (cli {n['cli']}, others {n['others']})" + (": " + ", ".join(f"{t} x{c}" for t, c in top) if top else "")
+            + (f"; {n['note']}" if n.get("note") else ""))
+
+
 def fence_profile(c):
     """c: home, folders (the first writable unless readonly), readonly, siwithin_home, config_dir, run, tmp (bool), last_message (bool), fence (config section), read_extra, write_extra."""
     home, f = c.home, c.fence
@@ -569,7 +640,8 @@ def fence_profile(c):
                 .replace("@DENY_READ@", sb_rule("deny", "file-read*", sub(home)))
                 .replace("@ALLOW_READ@", sb_rule("allow", "file-read*", *[sub(r) for r in reads], *[lit(os.path.join(home, r)) for r in f["rc_files"]]))
                 .replace("@ALLOW_WRITE@", sb_rule("allow", "file-write*", *[sub(w) for w in writes]))
-                .replace("@DENY_EXEC@", sb_rule("deny", "process-exec", *[lit(x) for x in f["deny_exec"]])))
+                .replace("@DENY_EXEC@", sb_rule("deny", "process-exec", *[lit(x) for x in f["deny_exec"]]))
+                .replace("@NETWORK@", network_rules(f.get("network", "proxy"), c.run)))
     out = [x for x in head.split("\n") if x]  # a rule with nothing to list is left out, not written empty
     out.append("; this run's folders, readable" + ("" if c.readonly else "; the first also writable"))
     out += [sb_rule("allow", "file-read*", sub(d)) for d in c.folders]
@@ -735,6 +807,17 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     if P.proxy_on and not (ad["key_env"] and ad["base_url_env"]): raise Refused(f"adapter {name}: auth proxy needs key_env and base_url_env, the variables the run reads its key and its API address from")
     P.key_sources = [ad["key_env"]] if P.proxy_on else list(ad["key_sources_ok"])  # through the proxy the run's key is the token, in the key variable
 
+    # the network
+    net = o.network or cfg["fence"].get("network")
+    if net not in NET_MODES: raise Refused(f"{'--network' if o.network else 'config.toml: [fence] network'} must be one of {', '.join(NET_MODES)}, not {net!r}")
+    P.network = net
+    if net == "proxy":
+        if P.proxy_on: chk("ok", "network: the run may open only the key proxy's loopback port; every other socket, DNS included, is refused by the fence, and the refusals are counted in summary.json (network) from the kernel's report")
+        else: chk("refuse", f"network: proxy ([fence] network) allows the run only the key proxy's port, and adapter {name} has auth = \"env\", which starts no proxy; "
+                            "set network = \"open\" under [fence] or pass --network open to leave the network as it was, or set auth = \"proxy\"")
+    elif net == "report": chk("warn", "network: open; every socket the run opens is reported in summary.json (network), nothing is refused: a survey, not a wall")
+    else: chk("warn", "network: open and unreported; a run can send anything it can read to any host")
+
     # api key check
     req = o.require_api_key if o.require_api_key is not None else ad["require_api_key"]
     P.require_key = req
@@ -819,7 +902,7 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
         rp = os.path.realpath(P.bin_path)
         bin_dirs = [q for q in (os.path.dirname(os.path.abspath(P.bin_path)), os.path.dirname(rp), rp.split("/lib/node_modules/")[0] if "/lib/node_modules/" in rp else None) if q and under(q, home) and q != home]
     P.profile = fence_profile(SimpleNamespace(home=home, folders=dirs, readonly=o.readonly, siwithin_home=siwithin_home, config_dir=P.config_dir, run=run, tmp=bool(ad["tmp_env"]),
-                                              last_message=P.last_message, fence=cfg["fence"], read_extra=[os.path.join(home, r) for r in ad["read_home"]] + bin_dirs,
+                                              last_message=P.last_message, fence=dict(cfg["fence"], network=P.network), read_extra=[os.path.join(home, r) for r in ad["read_home"]] + bin_dirs,
                                               write_extra=[os.path.join(home, w) for w in ad["write_home"]]))
     P.sb_path = os.path.join(run, "fence.sb")
     P.argv = [SANDBOX_EXEC, "-f", P.sb_path] + P.cmd
@@ -843,7 +926,7 @@ def show_plan(P):
     if P.proxy_on:
         pr(f"auth: proxy 127.0.0.1:<port>\nupstream: {P.upstream}, {P.upstream_timeout}s a request; the port is chosen when a real run starts, and nothing listens in this one")
         pr(f"paths: {', '.join(P.paths) or 'none'} ([auth] paths); any other path gets 403 and is not forwarded, and the real key is never attached to it")
-    pr("\n== fence profile ==\n" + P.profile)
+    pr("\n== fence profile ==\n" + P.profile.replace(PROXY_PORT, "<port>"))
     pr("== config checks ==")
     for lv, t in P.checks: pr(f"{lv:<6} {t}")
     pr("\n== budget ==")
@@ -1383,7 +1466,10 @@ def execute(P, cfg):
 def run_cli(P, cfg, proxy):
     ad, run, d = P.ad, P.run, P.dirs[0]
     with open(f"{run}/brief.md", "w", encoding="utf-8") as f: f.write(P.brief)
-    with open(P.sb_path, "w", encoding="utf-8") as f: f.write(P.profile)
+    profile = P.profile.replace(PROXY_PORT, str(proxy.port)) if proxy else P.profile
+    if PROXY_PORT in profile: raise Refused("the fence profile names the key proxy's port and no proxy was started: an adapter with auth = \"env\" needs [fence] network = \"open\"")
+    with open(P.sb_path, "w", encoding="utf-8") as f: f.write(profile)
+    t_net = datetime.datetime.now()  # the kernel's report is read from here: the version and auth probes run under this profile, and its mark, before the CLI does
     notes = list(P.notes)
     if ad["unconfirmed"]: notes.append(f"adapter {P.adapter} rests on assumptions {UNCONFIRMED} in the CLI's docs: {', '.join(ad['unconfirmed'])}")
 
@@ -1407,7 +1493,7 @@ def run_cli(P, cfg, proxy):
 
     with open(f"{run}/command.txt", "w", encoding="utf-8") as f:
         f.write(shlex.join([SANDBOX_EXEC, "-f", P.sb_path] + P.shown) + "\n" + "environment: " + ", ".join(sorted(P.env)) + f"\ncli: {version}\n"
-                + (f"auth: proxy 127.0.0.1:{proxy.port}\n" if proxy else ""))
+                + (f"auth: proxy 127.0.0.1:{proxy.port}\n" if proxy else "") + f"network: {P.network}\n")
     feed = PARSERS[ad["output"]]
     st = new_state(P.model)
     killed = [None]
@@ -1491,6 +1577,18 @@ def run_cli(P, cfg, proxy):
     if walk.outlived: notes.append(f"{len(walk.outlived)} processes outlived the CLI and were killed")
     if proxy: proxy.drain(); proxy.freeze()  # requests in flight are booked or cut; the log is closed so the receipt can hash it
     mins = (datetime.datetime.now() - t0).total_seconds() / 60
+    net = {"mode": P.network, "mark": None, "refused": 0, "reported": 0, "targets": {}, "processes": {}, "cli": 0, "others": 0, "unparsed": 0, "late": 0, "note": "unreported"}
+    if P.network != "open":  # the kernel's report, read twice once the run's processes are gone, LOG_WAIT apart: every line under this run's mark, and nothing else; the kernel lands its coalesced lines up to about two seconds late, so the second read's figures stand and what landed between is noted
+        try:
+            figs = []
+            for _ in (1, 2):
+                time.sleep(LOG_WAIT)
+                figs.append(network_figures(P.network, net_mark(run), read_sandbox_report(net_mark(run), t_net - datetime.timedelta(seconds=1), datetime.datetime.now() + datetime.timedelta(seconds=1)), proc.pid))
+            net = figs[1]; net["late"] = sum(figs[1][k] - figs[0][k] for k in ("refused", "reported", "unparsed"))
+            if net["late"]: notes.append(f"network: {net['late']} of the kernel's lines landed between the first read of its report and the second, {LOG_WAIT:g}s apart; the second read's figures stand")
+        except OSError as x:
+            net.update(mark=net_mark(run), note=f"the kernel's report could not be read: {x}"); notes.append(f"network: the kernel's report could not be read ({x}); the fence's refusals, if any, are uncounted")
+        if net["unparsed"]: notes.append(f"network: {net['unparsed']} lines under the run's mark in the kernel's report are not in the shape this version reads")
 
     text = st["text"]
     if P.last_message:  # the adapter has the CLI write its final message to a file; the last message in the events is the fallback
@@ -1549,7 +1647,7 @@ def run_cli(P, cfg, proxy):
                "minutes": round(mins, 1), "budget": P.budget, "cli_cost": cli, "true_cost": true, "stream_cost": stream_cost, "true_cost_is_ceiling": ceiling, "tokens_in": tin, "tokens_out": tout,
                "key_source": st["key_source"], "session_id": st["session"], "denials": st["denials"], "exit": proc.returncode, "outlived": len(walk.outlived), "cli_version": version,
                "prices_read_on": str(cfg["prices"].get("read_on") or ""), "contract": contract, "out": out_path, "notes": notes,
-               "proxy_cost": round(pf["cost"], 6) if pf else None, "proxy_requests": pf["requests"] if pf else None, "proxy_refused": pf["refused"] if pf else None}
+               "proxy_cost": round(pf["cost"], 6) if pf else None, "proxy_requests": pf["requests"] if pf else None, "proxy_refused": pf["refused"] if pf else None, "network": net}
     with open(f"{run}/summary.json", "w", encoding="utf-8") as f: json.dump(summary, f, indent=1)
     clean = lambda s: re.sub(r"[|\r\n]+", "/", str(s))
     tcost = f"true ${true:.4f}" + (" (ceiling, usage unreported)" if ceiling else "")
@@ -1577,7 +1675,7 @@ def run_cli(P, cfg, proxy):
     total, _ = ledger_total(P.ledger_path)
     print(f"{NAME} {status} | {P.adapter} {P.label} {P.effort or '-'} | {st['turns'] or '-'} turns | {mins:.1f} min | {ccost} | {tcost} | in {tin // 1000}k out {tout // 1000}k"
           f" | paid by {st['key_source'] or '-'} | denials {len(st['denials'])} | ledger true total ${total:.2f} of cap ${P.cap:.2f}\nrun: {run}\nsession: {st['session']}"
-          + (f"\nreceipt: {receipt}" if receipt else "") + (f"\nout: {out_path}" if out_path else ""), flush=True)
+          + (f"\nreceipt: {receipt}" if receipt else "") + (f"\nout: {out_path}" if out_path else "") + "\n" + network_line(net), flush=True)
     if "done" in contract: print(f"done text {contract['done']['text']!r}: " + ("found" if contract["done"]["found"] else "MISSING"))
     if "absent" in contract: print(f"absent text {contract['absent']['text']!r}: " + ("FOUND" if contract["absent"]["found"] else "not in the result"))
     for t, i in st["denials"]: print(f"denied: {t} {i}")
@@ -1594,6 +1692,7 @@ def parse_args(argv):
     add("--expect", metavar="HASH", help="with --verify: fail unless the last receipt on the ledger is this hash (keep it somewhere the ledger's writer cannot reach)")
     add("--read", action="append", default=[], help="a folder the run may read, repeatable")
     add("--readonly", action="store_true", help="the run's folder is readable only")
+    add("--network", choices=list(NET_MODES), help="the run's sockets: proxy (only the key proxy's loopback port; the default from [fence] network), report (open, every socket counted: a survey), open (unreported)")
     add("--adapter", help="which CLI adapter: claude, codex, or one declared in config.toml (default from config)")
     add("--model", help="model id or an adapter alias; needed for adapters that report tokens and no cost")
     add("--effort", help="reasoning effort, where the adapter supports it")

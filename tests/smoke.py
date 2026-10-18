@@ -59,6 +59,27 @@ def after(toks, flag): return toks[toks.index(flag) + 1]
 
 TESTKEY = "test-key-smoke-only-7f3a9c1e5b2d4086"  # made up, not shaped like a real key
 SONNET = (100 * 2.0 + 0 * 2.5 + 50 * 0.10 + 20 * 10.0) / 1e6  # one fake response priced at sonnet's [prices] rates: input 100, cache read 50, output 20
+LOGSHIM = r'''
+import glob, json, os, re, sys
+a = sys.argv[1:]
+with open(@CALLS@, "a") as f: f.write(json.dumps(a) + "\n")
+if os.environ.get("LOG_SHIM_FAIL"): sys.stderr.write("log: the report is not readable here\n"); sys.exit(1)
+assert a[:2] == ["show", "--start"] and a[a.index("--style") + 1] == "ndjson", a
+mark = re.search(r'eventMessage CONTAINS "([^"]+)"', a[a.index("--predicate") + 1]).group(1)
+assert mark.startswith("siwithin-net:"), mark
+nth = sum(mark in l for l in open(@CALLS@).read().splitlines())  # which read of this run's mark this is
+pids = [open(p).read().strip() for p in glob.glob(os.path.join(@EH@, ".config", "*", "runs", mark.split(":", 1)[1], "cli-pid.txt"))]
+pid = int(pids[0]) if pids else 4242
+def line(msg, image="/kernel"): print(json.dumps({"eventMessage": msg, "processImagePath": image}))
+line(f"2 duplicate reports for Sandbox: pclaude({pid}) deny(1) network-outbound remote:*:443\n{mark}")
+line(f"Sandbox: pclaude({pid}) deny(1) network-outbound /private/var/run/mDNSResponder\n{mark}")
+line(f"Sandbox: curl({pid + 1}) deny(1) network-outbound remote:*:443\n{mark}")
+line(f"Sandbox: pclaude({pid}) allow network-outbound remote:*:9\n{mark}")
+if os.environ.get("LOG_SHIM_LATE") and nth >= 2: line(f"1 duplicate report for Sandbox: pclaude({pid}) deny(1) network-outbound remote:*:443\n{mark}")  # a coalesced line that lands after the first read
+line("log run noninteractively, parent: 1 (zsh), args: '/usr/bin/log' 'show' '--predicate' 'eventMessage CONTAINS \"" + mark + "\"'", "/usr/bin/log")
+print(json.dumps({"processImagePath": "/kernel"}))
+print("")
+'''
 PCLAUDE = r'''
 import json, os, subprocess, sys, time, urllib.error, urllib.request
 a = sys.argv[1:]
@@ -71,6 +92,7 @@ def ev(o): print(json.dumps(o), flush=True)
 def note(name, text):
     with open(os.path.join(run, name), "a") as f: print(text, file=f)
 with open(os.path.join(run, "cli-env.json"), "w") as f: json.dump(dict(os.environ), f)  # names and values, for the test to read
+with open(os.path.join(run, "cli-pid.txt"), "w") as f: f.write(str(os.getpid()))  # the CLI's pid: the log shim puts it on its canned lines, so the figures' cli/others split is tested end to end
 def call(path="/v1/messages", stream=True, key=None, model="claude-sonnet-5-5", header="x-api-key", first_byte=False):
     body = json.dumps({"model": model, "max_tokens": 16, "stream": stream, "messages": [{"role": "user", "content": "hi"}]}).encode()
     value = key or token
@@ -324,6 +346,34 @@ def proxy_checks(whole, last_run, ledger, EH, ED, BIN, UP, pids):
     def jl(path): return [json.loads(l) for l in open(path).read().split("\n") if l]
 
     PF = mkhome("proxy")
+
+    # ---- the network wall's figures: fence.sb names the proxy's real port, and the kernel's report (the log shim's canned lines here, under the run's mark) is counted in summary.json
+    NF = mkhome("net"); calls_path = os.path.join(os.path.dirname(BIN), "log-calls.txt")
+    rc, out, err, r, s, recs = fresh(NF, "a plain run under the network wall\n")
+    cmd_txt = open(os.path.join(r, "command.txt")).read(); port = int(re.search(r"^auth: proxy 127\.0\.0\.1:(\d+)$", cmd_txt, re.M).group(1)); sb = open(os.path.join(r, "fence.sb")).read()
+    mark = f"siwithin-net:{os.path.basename(r)}"; pid = int(open(os.path.join(r, "cli-pid.txt")).read()); nw = s["network"]
+    check(rc == 0 and f'(deny network* (with message "{mark}"))\n(allow network-outbound (remote ip "localhost:{port}"))' in sb and "@PROXY_PORT@" not in sb and "network: proxy\n" in cmd_txt,
+          f"network 12: the run's fence.sb refuses every socket under the run's own mark and allows the proxy's real port {port}; command.txt records the mode")
+    mine = [json.loads(l) for l in open(calls_path).read().splitlines() if mark in l]
+    check(len(mine) == 2 and all(m[:2] == ["show", "--start"] and m[2] <= m[4] and m[-2] == "--predicate" and m[-1] == f'eventMessage CONTAINS "{mark}"' for m in mine) and mine[0][4] <= mine[1][4],
+          f"network 12b: the kernel's report was read twice, by the run's mark, between the run's times, the second read's end no earlier than the first's: {mine}")
+    check(nw["mode"] == "proxy" and nw["mark"] == mark and (nw["refused"], nw["reported"], nw["cli"], nw["others"], nw["unparsed"], nw["late"]) == (4, 1, 4, 1, 0, 0) and nw["processes"] == {f"pclaude({pid})": 4, f"curl({pid + 1})": 1}
+          and nw["targets"]["deny network-outbound remote:*:443"] == 3 and not s["notes"], f"network 12c: summary.json's network figures: the refusals counted, the CLI's own pid {pid} told from the others': {nw}")
+    check("\nnetwork: proxy, refused 4 (cli 4, others 1): deny network-outbound remote:*:443 x3, allow network-outbound remote:*:9 x1, deny network-outbound /private/var/run/mDNSResponder x1\n" in out, f"network 12d: the line is printed after the summary line: {out[:400]!r}")
+    rc, out, err, r, s, recs = fresh(NF, "a plain run, the network reported\n", ["--network", "report"])
+    mark = f"siwithin-net:{os.path.basename(r)}"; sb = open(os.path.join(r, "fence.sb")).read(); nw = s["network"]
+    check(rc == 0 and f'(allow (with report) network* (with message "{mark}"))' in sb and "(deny network" not in sb and nw["mode"] == "report" and nw["reported"] == 1 and "network: report\n" in open(os.path.join(r, "command.txt")).read()
+          and "\nnetwork: report, reported 1 (cli 4, others 1): " in out, f"network 14: --network report on a proxy home: the report rule in fence.sb, the figures and the line say report: {nw}")
+    rc, out, err, r, s, recs = fresh(NF, "a plain run, the report unreadable\n", env=dict(KEY, LOG_SHIM_FAIL="1"))
+    nw = s["network"]
+    check(rc == 0 and s["status"] == "done" and nw["refused"] == 0 and nw["mark"] == f"siwithin-net:{os.path.basename(r)}" and "show exit 1: log: the report is not readable here" in nw["note"]
+          and sum(n.startswith("network: the kernel's report could not be read (") and n.endswith("the fence's refusals, if any, are uncounted") for n in s["notes"]) == 1
+          and "\nnetwork: proxy, refused 0 (cli 0, others 0); the kernel's report could not be read: " in out, f"network 15: when the report cannot be read the run still ends done, the figures are zero with the reason, and the note says the refusals are uncounted: {nw['note']!r}")
+    rc, out, err, r, s, recs = fresh(NF, "a plain run, a line landing late\n", env=dict(KEY, LOG_SHIM_LATE="1"))
+    nw = s["network"]; pid = int(open(os.path.join(r, "cli-pid.txt")).read())
+    check(rc == 0 and s["status"] == "done" and (nw["refused"], nw["late"]) == (5, 1) and nw["targets"]["deny network-outbound remote:*:443"] == 4 and nw["processes"][f"pclaude({pid})"] == 5
+          and s["notes"] == ["network: 1 of the kernel's lines landed between the first read of its report and the second, 0s apart; the second read's figures stand"]
+          and "\nnetwork: proxy, refused 5 (cli 5, others 1): deny network-outbound remote:*:443 x4, " in out, f"network 16: a coalesced line that lands between the two reads is counted by the second and noted: {nw} {s['notes']}")
     TAIL = re.compile(r" \| receipt ([0-9a-f]{64})$")
 
     # ---- the plain run: three requests that pass, one with a wrong token
@@ -531,7 +581,10 @@ def proxy_checks(whole, last_run, ledger, EH, ED, BIN, UP, pids):
     rc, out, err = whole(["--home", PB, "--dir", ED], extra_env={"ANTHROPIC_API_KEY": None})
     check(rc == 1 and "refused: auth: [auth] key_command exited 3" in err, f"proxy 12c: a key_command that fails refuses the run, naming no key: {err.strip()[:100]}")
 
-    PE = mkhome("proxy-env", adapter='bin = "pclaude"\nauth = "env"\n')
+    PE = mkhome("proxy-env", adapter='bin = "pclaude"\nauth = "env"\n', auth_extra='[fence]\nnetwork = "open"\n')
+    rc_p, out_p, _ = tool_cli(["--home", PE, "--dir", PROJ, "--dry-run", "--network", "proxy"], env=dict(ENV, **KEY))
+    check(rc_p == 1 and 'refuse network: proxy ([fence] network) allows the run only the key proxy\'s port, and adapter claude has auth = "env", which starts no proxy' in out_p,
+          "proxy 13b: the same home under network = proxy is refused in the checks: an env adapter has no proxy port to allow")
     rc, out, err, r, s, recs = fresh(PE, "MODE:envdump", env=KEY)
     cli_env = json.load(open(os.path.join(r, "cli-env.json")))
     rc_e, out_e, _ = tool_cli(["--home", PE, "--dir", PROJ, "--dry-run"], env=dict(ENV, **KEY))
@@ -563,7 +616,7 @@ def walk_tests(whole, last_run, EH, ED, BIN):
     write(os.path.join(BIN, "wclaude"), f"#!{sys.executable}\n" + WCLAUDE); os.chmod(os.path.join(BIN, "wclaude"), 0o755)
     WH = os.path.join(EH, ".config", "siwithin-walk"); os.makedirs(WH)
     write(os.path.join(WH, "cap"), "100")
-    write(os.path.join(WH, "config.toml"), '[adapters.claude]\nbin = "wclaude"\nauth = "env"\n')
+    write(os.path.join(WH, "config.toml"), '[adapters.claude]\nbin = "wclaude"\nauth = "env"\n[fence]\nnetwork = "open"\n')
     NOTE = "processes outlived the CLI and were killed"
     group("the walls: the kill walk")
     show[0] = True
@@ -682,6 +735,26 @@ try:
     NO_FILTER = r"\((allow|deny) (file-[a-z-]+\*?|process-exec)\)"  # a rule with nothing listed would apply to everything
     check(".ssh" not in prof and not any(re.fullmatch(NO_FILTER, x) for x in lines), "no .ssh allowed and no rule without a filter")
     check("/Users/" not in prof.replace(HOME, ""), "no path but the temporary home in the profile")
+    MARK = re.compile(r'^\(deny network\* \(with message "siwithin-net:[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-run"\)\)$')  # the run's mark is its folder's name
+    di = [i for i, x in enumerate(lines) if MARK.match(x)]
+    check(len(di) == 1 and lines[di[0] + 1] == '(allow network-outbound (remote ip "localhost:<port>"))' and not any("(with report)" in x for x in lines) and lines.index("(allow default)") < di[0],
+          f"network 1: by default the profile refuses every socket under the run's mark, then allows the key proxy's loopback port, shown as <port> in a dry run: {[x for x in lines if 'network' in x]}")
+    check("ok     network: the run may open only the key proxy's loopback port; every other socket, DNS included, is refused by the fence" in out, "network 1b: the check line says what the wall refuses")
+    rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--network", "report"])
+    prof2 = section(out2, "fence profile", "config checks"); lines2 = [x for x in prof2.split("\n") if x]
+    check(rc2 == good_rc and sum(1 for x in lines2 if re.fullmatch(r'\(allow \(with report\) network\* \(with message "siwithin-net:[^"]+"\)\)', x)) == 1 and not any(x.startswith("(deny network") for x in lines2)
+          and "warn   network: open; every socket the run opens is reported in summary.json (network), nothing is refused: a survey, not a wall" in out2,
+          f"network 2: --network report: one allow-with-report rule under the mark, no deny, and the warn: {[x for x in lines2 if 'network' in x]}")
+    rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--network", "open"])
+    prof2 = section(out2, "fence profile", "config checks"); lines2 = [x for x in prof2.split("\n") if x]
+    check(rc2 == good_rc and not any("network" in x for x in lines2 if not x.startswith(";")) and '; the network: open and unreported ([fence] network = "open")' in lines2
+          and "warn   network: open and unreported; a run can send anything it can read to any host" in out2, "network 3: --network open: no network rule, the comment in its place, and the warn")
+    NH = os.path.join(TMP, "net-bad"); os.makedirs(NH); write(os.path.join(NH, "cap"), "10"); write(os.path.join(NH, "config.toml"), '[fence]\nnetwork = "wall"\n')
+    rc2, out2, err2 = tool_cli(["--home", NH, "--dir", PROJ, "--dry-run", "--budget", "1"])
+    check(rc2 == 1 and err2.strip() == "refused: config.toml: [fence] network must be one of proxy, report, open, not 'wall'" and "== command ==" not in out2, f"network 4: a config value outside the three is refused before anything is printed, naming the key: {err2.strip()!r}")
+    rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5"])
+    lines2 = [x for x in section(out2, "fence profile", "config checks").split("\n") if x]
+    check(rc2 == good_rc and any(MARK.match(x) for x in lines2), "network 4b: the next dry run on the default config is back to proxy mode")
     bud = section(out, "budget", "\0")
     check("$6.50 true over 2 runs" in bud and "$6.50 + $5.00 = $11.50 of $10.00" in bud and "REFUSED" in bud, "cap arithmetic printed: 6.50 + 5.00 passes 10.00")
     rc, out, err = tool_cli(["--dir", PROJ, "--dry-run"])
@@ -695,7 +768,7 @@ try:
     bud = section(out, "budget", "\0")
     N = siwithin.NAME
     rc, out, err = tool_cli(["--version"])
-    check(rc == 0 and out.strip() == "siwithin 0.3.0", f"--version prints siwithin 0.3.0: {out.strip()!r}")
+    check(rc == 0 and out.strip() == "siwithin 0.4.0", f"--version prints siwithin 0.4.0: {out.strip()!r}")
     check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
     check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
           "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -735,7 +808,7 @@ try:
 
     group("codex dry run")
     FH2 = os.path.join(TMP, "elsewhere"); os.makedirs(FH2)
-    write(os.path.join(FH2, "cap"), "50"); write(os.path.join(FH2, "config.toml"), '[prices]\n"made-up-1" = [1.0, 1.0, 0.5, 4.0]\n')
+    write(os.path.join(FH2, "cap"), "50"); write(os.path.join(FH2, "config.toml"), '[prices]\n"made-up-1" = [1.0, 1.0, 0.5, 4.0]\n[fence]\nnetwork = "open"\n')
     base = ["--home", FH2, "--adapter", "codex", "--dir", PROJ, "--dry-run"]
     rc, out, err = tool_cli(base + ["--model", "gpt-5.3-codex"])
     check(rc == 1 and "--soft-budget" in err and "== command ==" not in out, "codex: refused without --soft-budget, with the reason")
@@ -766,6 +839,9 @@ try:
     check("--read folders" in out or "not told about --read" in out, "codex: --read folder not announced to the CLI, said so")
     rc, out, err = tool_cli(["--home", FH2, "--adapter", "codex", "--dir", PROJ, "--dry-run", "--soft-budget", "--model", "made-up-1"])
     check(rc == good_rc and "1.0 / 1.0 / 0.5 / 4.0" in out, "codex: a price row from config.toml is merged in")
+    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--budget", "2", "--network", "proxy"])
+    check(rc == 1 and 'refuse network: proxy ([fence] network) allows the run only the key proxy\'s port, and adapter codex has auth = "env", which starts no proxy; set network = "open" under [fence] or pass --network open' in out
+          and "== command ==" in out, "network 5: codex (auth = env) under network = proxy is refused in the checks, with the way out named; the plan is still printed")
     rc, out, err = tool_cli(["--home", FH2, "--adapter", "nope", "--dir", PROJ, "--dry-run"])
     check(rc == 1 and "unknown adapter" in err, "unknown adapter refused")
     if not DARWIN:
@@ -837,6 +913,27 @@ try:
     pl = [x for x in siwithin.fence_profile(c).split("\n") if x and not x.startswith(";")]
     check(not any(re.fullmatch(NO_FILTER, x) for x in pl) and not any("process-exec" in x for x in pl), "empty lists leave no rule behind (an empty allow would allow everything)")
     check('(allow file-read-metadata (literal "/h/.config")' in " ".join(pl) or '(literal "/h/.config")' in " ".join(pl), "folders above allowed ones get metadata only")
+    di = pl.index('(deny network* (with message "siwithin-net:r"))')
+    check(pl[di + 1] == '(allow network-outbound (remote ip "localhost:@PROXY_PORT@"))' and siwithin.PROXY_PORT == "@PROXY_PORT@", "network 6: the builder's proxy mode: the deny under the run's mark, then the allow with the port's placeholder")
+    check(siwithin.network_rules("report", "/x/runs/r2").split("\n")[-1] == '(allow (with report) network* (with message "siwithin-net:r2"))'
+          and siwithin.network_rules("open", "/x/runs/r3") == '; the network: open and unreported ([fence] network = "open")', "network 7: the builder's report mode is one allow-with-report rule, its open mode a comment")
+    try: siwithin.network_rules("wall", "/x/runs/r"); bad = None
+    except siwithin.Refused as x: bad = str(x)
+    check(bad == "[fence] network must be one of proxy, report, open, not 'wall'", f"network 8: the builder refuses a mode outside the three: {bad!r}")
+    M = "siwithin-net:r"
+    msgs = [f"2 duplicate reports for Sandbox: claude(100) deny(1) network-outbound remote:*:443\n{M}", f"Sandbox: claude(100) deny(1) network-outbound /private/var/run/mDNSResponder\n{M}",
+            f"Sandbox: curl(101) deny(1) network-outbound remote:*:443\n{M}", f"Sandbox: claude(100) allow network-outbound remote:*:9\n{M}",
+            f"log run noninteractively, parent: 1 (zsh), args: '/usr/bin/log' 'show' '--predicate' 'eventMessage CONTAINS \"{M}\"'",  # the log's own line about the read: the mark in its arguments, no second line
+            f"Sandbox: claude(100) deny(1) file-read-data /etc/hosts\n{M}", f"Sandbox: claude(100) deny(1) network-outbound remote:*:443\nsiwithin-net:other"]
+    nf = siwithin.network_figures("proxy", M, msgs, 100)
+    check((nf["refused"], nf["reported"], nf["cli"], nf["others"], nf["unparsed"], nf["late"]) == (4, 1, 4, 1, 1, 0)
+          and nf["targets"] == {"deny network-outbound remote:*:443": 3, "deny network-outbound /private/var/run/mDNSResponder": 1, "allow network-outbound remote:*:9": 1} and nf["processes"] == {"claude(100)": 4, "curl(101)": 1},
+          f"network 9: the figures count a coalesced line as the N duplicates the kernel states after the plain line it logged, split the CLI's pid from the others, skip the log's own line and another run's mark, and count a line of another shape as unparsed: {nf}")
+    check(siwithin.network_line(nf) == "network: proxy, refused 4 (cli 4, others 1): deny network-outbound remote:*:443 x3, allow network-outbound remote:*:9 x1, deny network-outbound /private/var/run/mDNSResponder x1",
+          f"network 10: the printed line, targets by count: {siwithin.network_line(nf)!r}")
+    check(siwithin.network_line(dict(nf, mode="report")).startswith("network: report, reported 1 (cli 4, others 1): ") and siwithin.network_line({"mode": "open"}) == "network: open, unreported"
+          and siwithin.network_line(dict(nf, targets={}, note="the kernel's report could not be read: x")) == "network: proxy, refused 4 (cli 4, others 1); the kernel's report could not be read: x",
+          "network 11: the line in report and open modes, and with a note")
     write(os.path.join(TMP, "l.md"), "# header with true $9 in it\n2026-10-01 09:00 | a | /x | y | z | true $1.5000 | done\nnot a line | true $7\n2026-10-02 09:00 | b | true $0.2500 (ceiling)\n")
     check(siwithin.ledger_total(os.path.join(TMP, "l.md")) == (1.75, 2), "ledger total counts dated lines only")
 
@@ -847,9 +944,11 @@ try:
         for p in (EF, BIN, ED): os.makedirs(p)
         write(os.path.join(EF, "cap"), "100")
         # these fakes make no API requests, so their runs are 0.2.1's: the key in the environment (auth = "env"); the proxy's runs are further down, in their own home
-        write(os.path.join(EF, "config.toml"), '[adapters.claude]\nauth = "env"\nenv_pass = ["ANTHROPIC_API_KEY", "FAKE_AUTH"]   # the fake CLI is told how to answer through a listed variable\n')
+        write(os.path.join(EF, "config.toml"), '[adapters.claude]\nauth = "env"\nenv_pass = ["ANTHROPIC_API_KEY", "FAKE_AUTH"]   # the fake CLI is told how to answer through a listed variable\n[fence]\nnetwork = "open"   # auth = env starts no proxy, so the network stays as it was\n')
         shim =os.path.join(BIN, "sandbox-shim")
         write(shim, f"#!{sys.executable}\nimport os, sys\nassert sys.argv[1] == '-f' and os.path.isfile(sys.argv[2])\nos.execv(sys.argv[3], sys.argv[3:])\n")
+        logshim = os.path.join(BIN, "log-shim")  # stands in for /usr/bin/log: a fake run leaves nothing in the kernel's report, so canned lines under the run's mark come back, the CLI's pid on them
+        write(logshim, f"#!{sys.executable}\n" + LOGSHIM.replace("@CALLS@", repr(os.path.join(E, "log-calls.txt"))).replace("@EH@", repr(EH)))
         write(os.path.join(BIN, "claude"), f"""#!{sys.executable}
 import json, os, subprocess, sys, time
 a = sys.argv[1:]
@@ -894,22 +993,22 @@ open(a[a.index("--output-last-message") + 1], "w").write("codex says DONE-MARKER
 ev({{"type": "turn.completed", "usage": {{"input_tokens": 1000000, "cached_input_tokens": 500000, "output_tokens": 100000, "reasoning_output_tokens": 0}}}})
 if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
 """)
-        for p in ("sandbox-shim", "claude", "codex"): os.chmod(os.path.join(BIN, p), 0o755)
+        for p in ("sandbox-shim", "log-shim", "claude", "codex"): os.chmod(os.path.join(BIN, p), 0o755)
         write(os.path.join(BIN, "fake-ps"), f"#!{sys.executable}\n" + FAKE_PS); os.chmod(os.path.join(BIN, "fake-ps"), 0o755)
         REAL_PS = ps_works(siwithin.PS)  # every run below looks at the process table: with no working ps each would carry a note
         if not REAL_PS: siwithin.PS = os.path.join(BIN, "fake-ps")
         print("   (the kill walk's checks run against " + ("the real ps)" if REAL_PS else f"a stand-in for ps, because the real one cannot be run here; the stand-in works: {ps_works(siwithin.PS)})"))
-        saved_env, saved_stdin, saved_sb = dict(os.environ), sys.stdin, siwithin.SANDBOX_EXEC
+        saved_env, saved_stdin, saved_sb, saved_log = dict(os.environ), sys.stdin, siwithin.SANDBOX_EXEC, (siwithin.LOG_BIN, siwithin.LOG_WAIT)
         SECRET = "sk-test-NOT-A-REAL-KEY-12345"
 
         def whole(args, brief="do the thing\n", extra_env=None):
             env = {"HOME": EH, "PATH": BIN + ":/usr/bin:/bin", "USER": "t", "ANTHROPIC_API_KEY": SECRET, "CODEX_API_KEY": SECRET, "UNLISTED_VARIABLE": "x", **(extra_env or {})}
             os.environ.clear(); os.environ.update({k: v for k, v in env.items() if v is not None})  # a None in extra_env leaves the variable out
-            sys.stdin = io.StringIO(brief); siwithin.SANDBOX_EXEC = shim
+            sys.stdin = io.StringIO(brief); siwithin.SANDBOX_EXEC = shim; siwithin.LOG_BIN, siwithin.LOG_WAIT = logshim, 0
             o, e = io.StringIO(), io.StringIO(); so, se = sys.stdout, sys.stderr; sys.stdout, sys.stderr = o, e
             try: rc = siwithin.main(args)
             finally:
-                sys.stdout, sys.stderr = so, se; os.environ.clear(); os.environ.update(saved_env); sys.stdin = saved_stdin; siwithin.SANDBOX_EXEC = saved_sb
+                sys.stdout, sys.stderr = so, se; os.environ.clear(); os.environ.update(saved_env); sys.stdin = saved_stdin; siwithin.SANDBOX_EXEC = saved_sb; siwithin.LOG_BIN, siwithin.LOG_WAIT = saved_log
             return rc, o.getvalue(), e.getvalue()
 
         def last_run(home=EF):
@@ -926,6 +1025,9 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(rc == 0 and s["status"] == "done", f"claude run done: rc {rc}, {s.get('status')}, {err}")
         check(abs(s["true_cost"] - 0.30) < 1e-9 and s["cli_cost"] == 0.3 and s["turns"] == 3 and s["tokens_in"] == 100000 and s["tokens_out"] == 10000, f"cost, turns, tokens in the summary: {s}")
         check(s["key_source"] == "ANTHROPIC_API_KEY" and s["session_id"] == "sess-1" and s["cli_version"] == "2.1.296" and not s["notes"], f"key source, session, CLI version, no notes: {s['notes']}")
+        check(s["network"] == {"mode": "open", "mark": None, "refused": 0, "reported": 0, "targets": {}, "processes": {}, "cli": 0, "others": 0, "unparsed": 0, "late": 0, "note": "unreported"} and "network: open, unreported" in out
+              and '; the network: open and unreported ([fence] network = "open")' in open(os.path.join(last_run()[0], "fence.sb")).read() and "network: open\n" in open(os.path.join(last_run()[0], "command.txt")).read()
+              and not os.path.exists(os.path.join(E, "log-calls.txt")), f"network 13: an auth = env home with network = open: the comment in fence.sb, no read of the kernel's report, the figures say unreported: {s.get('network')}")
         check(s["contract"] == {"done": {"text": "DONE-MARKER", "found": True}, "absent": {"text": "TODO", "found": False}}, "--done found, --absent not found")
         check(open(os.path.join(ED, "out", "result.txt")).read() == "All good. DONE-MARKER" and open(os.path.join(r, "result.md")).read() == "All good. DONE-MARKER", "--out written inside --dir, result.md written")
         check(all(os.path.exists(os.path.join(r, f)) for f in ("brief.md", "command.txt", "events.jsonl", "stderr.txt", "result.md", "summary.json", "fence.sb")) and r.endswith("-first-run"), "the run folder holds the record")
@@ -1032,7 +1134,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.3.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.4.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
@@ -1160,7 +1262,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         group("the walls: red briefs, scorer proven")
         rr = subprocess.run([sys.executable, os.path.join(ROOT, "tests", "red", "run.py"), "--fake"], capture_output=True, text=True, timeout=120)
         tail = rr.stdout.strip().split("\n")
-        check(rr.returncode == 0 and tail[-1] == "PASS" and "-- env-key" in rr.stdout and "-- outlive" in rr.stdout and "FAIL" not in rr.stdout, f"red 1: tests/red/run.py --fake passes with its env-key and outlive cases: {tail[-2:]}")
+        check(rr.returncode == 0 and tail[-1] == "PASS" and "-- env-key" in rr.stdout and "-- outlive" in rr.stdout and "-- net-out" in rr.stdout and "FAIL" not in rr.stdout, f"red 1: tests/red/run.py --fake passes with its env-key and outlive cases: {tail[-2:]}")
         print("   (" + [l for l in tail if "checks passed" in l][-1].strip() + " in the red scorer)" if any("checks passed" in l for l in tail) else "")
         proxy_tests(whole, last_run, ledger, EH, ED, BIN)
         walk_tests(whole, last_run, EH, ED, BIN)

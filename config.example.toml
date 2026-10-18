@@ -12,6 +12,7 @@ timeout = 2700       # seconds before a run is killed by the timer, when --timeo
 folders = []         # folders no run is given as --dir or --read, on top of the home root, ~/.ssh, ~/.config, ~/Library and each adapter's own_dir
 
 [fence]
+network = "proxy"   # the run's sockets: "proxy" allows only the key proxy's loopback port and refuses every other socket, DNS included, each refusal counted in summary.json; "report" leaves the network open and counts every socket the run opens (a survey); "open" leaves it open and unreported. An adapter with auth = "env" starts no proxy and needs "open"
 read_home = ["Library/Caches", "Library/Logs", "Library/Keychains", "Library/Python", ".gitconfig", ".config/git"]  # home-relative paths a run may read, on top of its folders
 write_home = ["Library/Caches", "Library/Logs"]  # home-relative paths a run may write, on top of its writable folder
 config_write = ["projects", "sessions", "session-env", "shell-snapshots", "file-history", "todos", "tasks", "debug", "statsig", "telemetry", "cache", "state", "logs", "paste-cache", "history.jsonl", ".last-cleanup"]  # paths inside the CLI's config directory a run may write, its state; the rest of that directory, settings, memory, skills, plugins and a key helper included, stays as the owner left it
