@@ -698,6 +698,226 @@ def walk_tests(whole, last_run, EH, ED, BIN):
             except OSError: pass
 
 
+def reconcile_tests():
+    import datetime, http.server, threading, urllib.parse
+    UTC = datetime.timezone.utc
+    MARK = "sk-ant-admin01-LEAKMARKER0123456789abcdef"  # made up: the admin key of every test below, which must reach the fake server's header and nowhere else
+    KEYID = "apikey_01AbCdEfGhIjKl"
+    group("reconcile")
+
+    class Fake(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def do_GET(self):
+            u, S = urllib.parse.urlsplit(self.path), self.server
+            q = urllib.parse.parse_qs(u.query)
+            S.seen.append({"path": u.path, "query": q, "headers": {k.lower(): v for k, v in self.headers.items()}})
+            if S.fail: status, body = S.fail
+            elif self.headers.get("x-api-key") != MARK: status, body = 401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+            elif u.path.endswith("/api_keys"): status, body = 200, S.keys
+            else: status, body = 200, S.pages.get((q.get("page") or [None])[0], {"data": [], "has_more": False, "next_page": None})
+            data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+            self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+
+    class Srv(http.server.ThreadingHTTPServer): daemon_threads = True
+
+    try: FAKE = Srv(("127.0.0.1", 0), Fake)
+    except OSError as x:
+        print(f"SKIPPED reconcile checks: no loopback server can be bound here ({x}); the tests are written, run them where one can")
+        return
+    FAKE.seen, FAKE.pages, FAKE.keys, FAKE.fail = [], {}, {"data": [], "has_more": False}, None
+    threading.Thread(target=FAKE.serve_forever, daemon=True).start()
+    base = os.path.join(TMP, "reconcile"); os.makedirs(base)
+    script = os.path.join(base, "admin-key.sh"); write(script, f"#!/bin/sh\nprintf '%s\\n' {MARK}\n"); os.chmod(script, 0o755)  # outside every home: a config that named the marker would hold it
+    homes, outputs = [], []
+    z = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+    local = lambda t: t.astimezone().replace(tzinfo=None)  # the ledger's and proxy.jsonl's times are the machine's local time
+    HOUR = datetime.timedelta(hours=1)
+    B0 = datetime.datetime(2026, 10, 16, 12, 0, tzinfo=UTC); B1 = B0 + HOUR
+    SINCE, UNTIL = local(B0 - 3 * HOUR).strftime("%Y-%m-%dT%H:%M"), local(B1 + 3 * HOUR).strftime("%Y-%m-%dT%H:%M")
+    SUMMARY = re.compile(r"reconcile: \d{4}-\d\d-\d\d \d\d:\d\d to \d{4}-\d\d-\d\d \d\d:\d\d \| provider \$\d+\.\d{4} \| runs \$\d+\.\d{4} \| unaccounted \$\d+\.\d{4} in \d+ buckets \| over \$\d+\.\d{4} in \d+ \| unpriced \d+ \| key apikey_01Ab…")
+
+    def res(model="claude-sonnet-5-5", tier="standard", unc=0, read=0, w5=0, w1=0, out=0, web=0):
+        return {"api_key_id": KEYID, "model": model, "service_tier": tier, "uncached_input_tokens": unc, "cache_read_input_tokens": read,
+                "cache_creation": {"ephemeral_5m_input_tokens": w5, "ephemeral_1h_input_tokens": w1}, "output_tokens": out, "server_tool_use": {"web_search_requests": web}}
+
+    def bucket(t, *results): return {"starting_at": z(t), "ending_at": z(t + HOUR), "results": list(results)}
+    def page(*buckets, more=None): return {"data": list(buckets), "has_more": more is not None, "next_page": more}
+    FULL = dict(unc=1_000_000, read=2_000_000, w5=500_000, w1=400_000, out=100_000, web=3)  # priced by hand: 2.00 + 0.20 + 1.25 + 0.4 x 2.5 x 1.6 = 1.60 + 1.00 + 0.03 = 6.08
+
+    def config(ids='["' + KEYID + '"]', cmd=script):
+        return (f'[auth]\nupstream = "http://127.0.0.1:{FAKE.server_address[1]}"\n[prices]\ncache_write_1h_factor = 1.6\nweb_search = 0.01\n"claude-sonnet-5-5" = [2.0, 2.5, 0.10, 10.0]\n'
+                f'[reconcile]\nadmin_key_command = "{cmd}"\napi_key_ids = {ids}\ntolerance = 0.05\n')
+
+    def mk_home(name, runs=(), **cfg):
+        """runs: (start in UTC, minutes, true dollars, [(UTC time, cost)], or None for a run with no proxy log)."""
+        h = os.path.join(base, name); os.makedirs(os.path.join(h, "runs")); homes.append(h)
+        write(os.path.join(h, "config.toml"), config(**cfg))
+        lines = ["# siwithin ledger: one line per run"]
+        for i, (t0, mins, true, reqs) in enumerate(runs):
+            lines.append(f"{local(t0):%Y-%m-%d %H:%M} | job | /x | claude sonnet - | 3 turns | {mins:.1f} min | cli $0.0000 | true ${true:.4f} | in 0k out 0k | runs/r{i} | done")
+            if reqs is not None:
+                ok = [json.dumps({"t": local(t).isoformat(timespec="milliseconds"), "path": "/v1/messages", "model": "claude-sonnet-5-5", "status": 200, "usage": {}, "cost": c, "total": 0, "client": 1, "refused": None}) for t, c in reqs]
+                refused = json.dumps({"t": local(t0).isoformat(timespec="milliseconds"), "path": "/v1/messages", "model": None, "status": 402, "usage": None, "cost": None, "total": 0, "client": 1, "refused": "budget"})
+                write(os.path.join(h, "runs", f"r{i}", "proxy.jsonl"), "\n".join(ok + [refused]) + "\n")
+        write(os.path.join(h, "ledger.md"), "\n".join(lines) + "\n")
+        return h
+
+    def rec(home, *extra, since=SINCE, until=UNTIL):
+        rc, out, err = tool_cli(["--home", home, "--reconcile", since, *(["--until", until] if until else []), *extra])
+        outputs.append(out + err)
+        return rc, out, err
+
+    def newest(home, ext):
+        d = os.path.join(home, "reconcile"); return os.path.join(d, max((f for f in os.listdir(d) if f.endswith(ext)), key=lambda f: (os.stat(os.path.join(d, f)).st_mtime_ns, f)))
+
+    def last_json(home): return json.load(open(newest(home, ".json")))
+    def summary(out): return out.rstrip("\n").split("\n")[-1]
+
+    def inproc(args):
+        saved = sys.stdout, sys.stderr
+        o, e = io.StringIO(), io.StringIO(); sys.stdout, sys.stderr = o, e
+        try: rc = siwithin.main(args)
+        finally: sys.stdout, sys.stderr = saved
+        outputs.append(o.getvalue() + e.getvalue())
+        return rc, o.getvalue(), e.getvalue()
+
+    def run_at(t0, cost, mins=25.0, n=2):  # a run whose proxy.jsonl holds n requests of cost / n each, in the bucket t0 is in
+        return (t0 + datetime.timedelta(minutes=10), mins, cost, [(t0 + datetime.timedelta(minutes=15 + i), round(cost / n, 4)) for i in range(n)])
+
+    # 1: paging
+    h1 = mk_home("paging")
+    FAKE.pages = {None: page(bucket(B0, res(unc=1_000_000)), more="page_2"), "page_2": page(bucket(B1, res(out=100_000)))}  # $2.00 and $1.00
+    FAKE.seen.clear(); rc, out, err = rec(h1)
+    q0 = FAKE.seen[0]["query"]
+    check(len(FAKE.seen) == 2 and FAKE.seen[1]["query"].get("page") == ["page_2"] and "page" not in q0 and "provider $3.0000 |" in summary(out) and last_json(h1)["totals"]["provider"] == 3.0,
+          f"reconcile 1: two pages joined by has_more and next_page, the figures the sum of both: {len(FAKE.seen)} requests, {summary(out)!r}")
+    check(FAKE.seen[0]["path"] == "/v1/organizations/usage_report/messages" and q0["api_key_ids[]"] == [KEYID] and q0["group_by[]"] == ["api_key_id", "model", "service_tier"] and q0["bucket_width"] == ["1h"]
+          and q0["limit"] == ["168"] and q0["starting_at"][0].endswith("Z") and FAKE.seen[0]["headers"]["x-api-key"] == MARK and FAKE.seen[0]["headers"]["anthropic-version"] == "2023-06-01",
+          f"reconcile 1b: the request carries the key ids, the three groupings, the width and the page size, the admin key and the version: {q0}")
+
+    # 2: arithmetic
+    h2 = mk_home("arithmetic")
+    FAKE.pages = {None: page(bucket(B0, res(**FULL)))}
+    rc, out, err = rec(h2); j2 = last_json(h2)
+    check(j2["totals"]["provider"] == 6.08 and j2["buckets"][0]["provider"] == 6.08 and "provider $6.0800 |" in summary(out) and "| 6.0800 |" in open(newest(h2, ".md")).read(),
+          f"reconcile 2: one bucket of every kind of token prices to the $6.08 worked by hand, the 1h factor applied: {j2['totals']['provider']}")
+
+    # 3: unaccounted
+    h3 = mk_home("unaccounted")
+    rc, out, err = rec(h3)
+    check(rc == 1 and SUMMARY.fullmatch(summary(out)) and "unaccounted $6.0800 in 1 buckets" in summary(out) and f"unaccounted: {z(B0)} provider $6.0800, runs $0.0000" in out and "report: " in out
+          and out.index("report: ") < out.index(summary(out)), f"reconcile 3: provider spend with no run is unaccounted, exit 1, the summary line names it: rc {rc}, {summary(out)!r}")
+
+    # 4: ok
+    h4 = mk_home("ok", [run_at(B0, 6.08)])
+    rc, out, err = rec(h4)
+    check(rc == 0 and SUMMARY.fullmatch(summary(out)) and "provider $6.0800 | runs $6.0800 | unaccounted $0.0000 in 0 buckets | over $0.0000 in 0 |" in summary(out) and last_json(h4)["buckets"][0]["verdict"] == "ok",
+          f"reconcile 4: the same bucket with a run whose proxy.jsonl matches is ok, exit 0: rc {rc}, {summary(out)!r}")
+
+    # 5: over, and within the tolerance
+    rc, out, err = rec(mk_home("over", [run_at(B0, 5.58)])); h5b = mk_home("within", [run_at(B0, 6.04)])
+    rcb, outb, errb = rec(h5b)
+    check(rc == 1 and "over $0.5000 in 1 |" in summary(out) and "unaccounted $0.0000 in 0 buckets" in summary(out) and rcb == 0 and "over $0.0000 in 0 |" in summary(outb) and last_json(h5b)["buckets"][0]["difference"] == 0.04,
+          f"reconcile 5: a run $0.50 short of the provider is over, exit 1; $0.04 short is within the $0.05 tolerance, exit 0: {summary(out)!r} {summary(outb)!r}")
+
+    # 8: unpriced, with a run active and with none
+    h8 = mk_home("unpriced", [run_at(B0, 0.0)]); h8b = mk_home("unpriced-none")
+    FAKE.pages = {None: page(bucket(B0, res(model="claude-mystery-9", unc=100, out=50)))}
+    rc, out, err = rec(h8); rcb, outb, errb = rec(h8b); r8 = last_json(h8)["buckets"][0]
+    check(rc == 0 and "provider $0.0000 |" in summary(out) and "unpriced 1 |" in summary(out) and r8["unpriced"] and r8["results"][0]["dollars"] is None and (r8["results"][0]["unc"], r8["results"][0]["out"]) == (100, 50)
+          and "unpriced: claude-mystery-9" in out and "| 100 | 0 | 0 | 0 | 50 | 0 | unpriced |" in open(newest(h8, ".md")).read(),
+          f"reconcile 8: a model with no price is shown with its tokens, not priced, and counted: {summary(out)!r}")
+    check(rcb == 1 and "unaccounted $0.0000 in 1 buckets" in summary(outb) and "unpriced 1 |" in summary(outb), f"reconcile 8b: tokens of a model with no price, with no run active, are still unaccounted: {summary(outb)!r}")
+    FAKE.pages = {None: page(bucket(B0, res(tier="priority", unc=1_000_000)))}
+    h8c = mk_home("tier"); rc, out, err = rec(h8c)
+    check("finding: service tier priority in 1 buckets" in out and last_json(h8c)["buckets"][0]["provider"] == 2.0, f"reconcile 8c: a service tier other than standard is priced as standard and named: {out.strip()[:200]!r}")
+
+    # 9: the CSV way
+    FAKE.pages = {None: page(bucket(B0, res(**FULL)))}
+    head = "Date (UTC),Model,Uncached Input Tokens,Cache Read Input Tokens,Cache Creation 5m Input Tokens,Cache Creation 1h Input Tokens,Output Tokens,Web Search Requests"
+    csv_ok, csv_bad = os.path.join(base, "usage.csv"), os.path.join(base, "usage-bad.csv")
+    write(csv_ok, head + "\n2026-10-16 12:00,claude-sonnet-5-5,1000000,2000000,500000,400000,100000,3\n2026-10-16 13:00,claude-sonnet-5-5,0,0,0,0,0,0\n")
+    write(csv_bad, head.replace(",Output Tokens", "") + "\n2026-10-16 12:00,claude-sonnet-5-5,1,2,3,4,3\n")
+    seen = len(FAKE.seen); rc, out, err = rec(h4, "--csv", csv_ok); jc = last_json(h4)
+    check(rc == 0 and len(FAKE.seen) == seen and jc["totals"]["provider"] == j2["totals"]["provider"] and jc["buckets"][0]["provider"] == j2["buckets"][0]["provider"] == 6.08 and jc["bucket"] == "1h"
+          and "key -" in summary(out), f"reconcile 9: a CSV export reconciles to the same figures as the API's JSON, with no request made: rc {rc}, {summary(out)!r} {err!r}")
+    rc, out, err = rec(h4, "--csv", csv_bad)
+    check(rc == 2 and err.strip().count("\n") == 0 and f"the header row is: {head.replace(',Output Tokens', '')}" in err and "output" in err.split("the header row")[0] and not out,
+          f"reconcile 9b: a header with a column missing is refused with the header printed: {err.strip()[:200]!r}")
+
+    # 7: refusals
+    FAKE.pages = {}; seen = len(FAKE.seen)
+    rc, out, err = rec(mk_home("no-command", cmd=""))
+    check(rc == 2 and "admin_key_command" in err and "--csv" in err and err.strip().count("\n") == 0 and len(FAKE.seen) == seen, f"reconcile 7: no admin_key_command and no --csv refuses naming both ways in: {err.strip()!r}")
+    FAKE.keys = {"data": [{"id": "apikey_01AAA", "name": "runs key", "partial_key_hint": "sk-ant-api03-R2D...igAA", "status": "active", "created_at": "2024-10-30T23:58:27Z"},
+                          {"id": "apikey_01BBB", "name": "other", "partial_key_hint": "sk-ant-api03-Q9X...zzBB", "status": "active"}], "has_more": False, "first_id": "apikey_01AAA", "last_id": "apikey_01BBB"}
+    FAKE.seen.clear(); rc, out, err = rec(mk_home("no-ids", ids="[]"))
+    check(rc == 2 and out.strip().split("\n") == ["apikey_01AAA | runs key | sk-ant-api03-R2D...igAA", "apikey_01BBB | other | sk-ant-api03-Q9X...zzBB"] and 'api_key_ids = ["<one of the ids above>"]' in err
+          and [s["path"] for s in FAKE.seen] == ["/v1/organizations/api_keys"], f"reconcile 7b: an empty api_key_ids lists the keys (id, name, hint) and refuses with the config line: {out.strip()!r} {err.strip()!r}")
+
+    # 6: the admin key never leaves
+    FAKE.fail = (401, {"type": "error", "error": {"type": "authentication_error", "message": f"invalid x-api-key {MARK} and sk-ant-api03-OTHERKEY12345"}})
+    rc, out, err = rec(h4)
+    check(rc == 2 and "401" in err and "authentication_error" in err and "<key>" in err and MARK not in err and "sk-ant-api03" not in err and err.strip().count("\n") == 0,
+          f"reconcile 6: a 401 is reported with its status and error type, the key and any sk-ant string replaced by <key>: {err.strip()!r}")
+    FAKE.fail = (500, "not json"); rc, out, err = rec(h4)
+    check(rc == 2 and "500" in err and err.strip().count("\n") == 0, f"reconcile 6b: a status other than 200 whose body is not JSON is still reported: {err.strip()!r}")
+    FAKE.fail = None; seen, reports = len(FAKE.seen), len(os.listdir(os.path.join(h4, "reconcile"))); rc, out, err = rec(h4, "--dry-run")
+    check(rc == 0 and len(FAKE.seen) == seen and len(os.listdir(os.path.join(h4, "reconcile"))) == reports and "x-api-key: <key>" in out and "usage_report/messages?starting_at=" in out and "api_key_ids[]=" + KEYID in out,
+          f"reconcile 6c: a dry run prints the URL and the headers with the key as <key>, requests nothing and writes nothing: {out.strip()[:160]!r}")
+    files = [os.path.join(d, f) for h in homes for d, _, fs in os.walk(h) for f in fs]
+    check(not [f for f in files if MARK.encode() in open(f, "rb").read()] and not [o for o in outputs if MARK in o] and len(files) > 20,
+          f"reconcile 6d: the admin key is in no file under any home, no report, no output and no error text: {len(files)} files, {len(outputs)} outputs read")
+
+    # 10: nothing is run, nothing is booked
+    FAKE.pages = {None: page(bucket(B0, res(**FULL)))}
+    shim = os.path.join(base, "sandbox-shim"); flag = os.path.join(base, "sandbox-was-run"); write(shim, f"#!/bin/sh\necho run >> {flag}\n"); os.chmod(shim, 0o755)
+    before, runs_before, saved = open(os.path.join(h4, "ledger.md")).read().split("\n"), sorted(os.listdir(os.path.join(h4, "runs"))), siwithin.SANDBOX_EXEC
+    siwithin.SANDBOX_EXEC = shim
+    try: rc, out, err = inproc(["--home", h4, "--reconcile", SINCE, "--until", UNTIL])
+    finally: siwithin.SANDBOX_EXEC = saved
+    check(rc == 0 and "provider $6.0800 |" in summary(out) and not os.path.exists(flag) and open(os.path.join(h4, "ledger.md")).read().split("\n") == before and sorted(os.listdir(os.path.join(h4, "runs"))) == runs_before
+          and not os.path.exists(os.path.join(h4, "lock")), f"reconcile 10: --reconcile starts no sandbox-exec and adds no ledger line ({len(before)} lines before and after): rc {rc}, {err!r}")
+
+    # 11: the red scorer's fake pass is unchanged
+    rr = subprocess.run([sys.executable, os.path.join(ROOT, "tests", "red", "run.py"), "--fake"], capture_output=True, text=True, timeout=120)
+    check(rr.returncode == 0 and "92 of 92 checks passed" in rr.stdout and rr.stdout.strip().endswith("PASS"), f"reconcile 11: tests/red/run.py --fake still passes 92 of 92: {rr.stdout.strip().splitlines()[-2:]}")
+
+    # not among the eleven: the watch, the config and the command line
+    W0 = datetime.datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - 2 * HOUR; wsince = local(W0 - HOUR).strftime("%Y-%m-%dT%H:%M")
+    FAKE.pages = {None: page(bucket(W0, res(unc=1_000_000)))}  # $2.00 in a bucket with no run
+    ticks = []; saved_sleep = siwithin.WATCH_SLEEP; siwithin.WATCH_SLEEP = lambda s: ticks.append(s)
+    try: rc, out, err = inproc(["--home", mk_home("watch-un"), "--reconcile", wsince, "--every", "60"])
+    finally: siwithin.WATCH_SLEEP = saved_sleep
+    check(rc == 1 and not ticks and len(out.strip().split("\n")) == 1 and "unaccounted $2.0000 in 1 buckets" in out, f"reconcile watch 1: the first unaccounted above the tolerance ends --every with exit 1, one line: rc {rc}, {out.strip()[:120]!r}")
+    hw = mk_home("watch-ok", [run_at(W0, 2.0)])
+    FAKE.pages = {None: page(bucket(W0, res(unc=1_000_000)))}; ticks.clear()
+
+    def tick(s):
+        ticks.append(s)
+        if len(ticks) == 2: FAKE.pages = {None: page(bucket(W0, res(unc=1_010_000)))}  # $2.02: a figure changed, still within the tolerance
+        if len(ticks) == 3: raise KeyboardInterrupt
+    siwithin.WATCH_SLEEP = tick
+    try: rc, out, err = inproc(["--home", hw, "--reconcile", wsince, "--every", "60"])
+    finally: siwithin.WATCH_SLEEP = saved_sleep
+    lines = [x for x in out.strip().split("\n") if x]
+    check(rc == 0 and ticks == [60, 60, 60] and len(lines) == 2 and "provider $2.0000 |" in lines[0] and "provider $2.0200 |" in lines[1], f"reconcile watch 2: --every prints a line only when a figure changed (3 looks, 2 lines): {ticks} {lines}")
+    seen = len(FAKE.seen)
+    r30, r_until, r_csv = rec(hw, "--every", "30", until=None)[0], rec(hw, "--every", "60")[0], inproc(["--home", hw, "--reconcile", wsince, "--every", "60", "--csv", csv_ok])[0]
+    check(r30 == r_until == r_csv == 2 and len(FAKE.seen) == seen and "--every must be at least 60" in outputs[-3] and "takes no --until" in outputs[-2] and "takes no --csv" in outputs[-1],
+          f"reconcile watch 3: --every under 60, with --until or with --csv is refused: {r30} {r_until} {r_csv}")
+    bad = mk_home("bad-tolerance"); write(os.path.join(bad, "config.toml"), config().replace("tolerance = 0.05", "tolerance = -1"))
+    rc, out, err = rec(bad)
+    check(rc == 2 and err.strip() == "refused: config.toml: [reconcile] tolerance must be a finite number, zero or above", f"reconcile config 1: a tolerance below zero is refused, naming the key: {err.strip()!r}")
+    ex = siwithin.parse_toml_mini(example)
+    check(ex["reconcile"] == siwithin.DEFAULT_CONFIG["reconcile"] == {"admin_key_command": "", "api_key_ids": [], "tolerance": 0.05} and ex["prices"]["cache_write_1h_factor"] == siwithin.DEFAULT_CONFIG["prices"]["cache_write_1h_factor"] == 1.6,
+          "reconcile config 2: config.example.toml carries [reconcile] and cache_write_1h_factor, every value the default")
+    rc, out, err = tool_cli(["--reconcile", SINCE, "--dir", PROJ])
+    check(rc == 2 and "--reconcile reads records and runs nothing" in err, f"reconcile cli 1: --reconcile with --dir is refused by the parser: {err.strip()[-90:]!r}")
+    FAKE.shutdown(); FAKE.server_close()
+
+
 try:
     # ---------------------------------------------------------------- part 1: dry runs
     write(os.path.join(FH, "cap"), "10\n")
@@ -768,7 +988,7 @@ try:
     bud = section(out, "budget", "\0")
     N = siwithin.NAME
     rc, out, err = tool_cli(["--version"])
-    check(rc == 0 and out.strip() == "siwithin 0.4.0", f"--version prints siwithin 0.4.0: {out.strip()!r}")
+    check(rc == 0 and out.strip() == "siwithin 0.5.0", f"--version prints siwithin 0.5.0: {out.strip()!r}")
     check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
     check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
           "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -1134,7 +1354,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.4.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.5.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
@@ -1266,6 +1486,9 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         print("   (" + [l for l in tail if "checks passed" in l][-1].strip() + " in the red scorer)" if any("checks passed" in l for l in tail) else "")
         proxy_tests(whole, last_run, ledger, EH, ED, BIN)
         walk_tests(whole, last_run, EH, ED, BIN)
+    show[0] = True
+    try: reconcile_tests()
+    finally: show[0] = False
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
 

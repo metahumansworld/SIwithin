@@ -36,6 +36,7 @@ paths = ["/v1/messages", "/v1/messages/count_tokens"]  # the only paths the prox
 read_on = "2026-10-13"   # the day these rates were read; a warning appears when they are older than 90 days
 source = "platform.claude.com/docs/en/about-claude/pricing; developers.openai.com/api/docs/pricing"  # where they were read
 web_search = 0.01        # dollars per web search request, added for any model that reports search requests
+cache_write_1h_factor = 1.6   # --reconcile only: a one-hour cache write costs this times the cache-write rate below (2.0x over 1.25x the input rate, read on 2026-10-18 at platform.claude.com/docs/en/about-claude/pricing)
 "claude-haiku-5-5" = [0.10, 0.125, 0.01, 0.50]
 "claude-sonnet-5-5" = [2.0, 2.5, 0.10, 10.0]
 "claude-opus-5-5" = [4.0, 5.0, 0.20, 20.0]
@@ -45,6 +46,12 @@ web_search = 0.01        # dollars per web search request, added for any model t
 
 # CLI budget units per true dollar, keyed by model id; a model not listed is 1. The budget flag gets budget x factor, and a warning appears when the CLI's own
 # cost over the true cost is more than four times the factor or less than a quarter of it. The streamed stop (usage_at = "message") does not use the factor.
+# --reconcile SINCE: the provider's usage report for the keys the runs spend, against what the runs account for. It runs nothing and writes no ledger line.
+[reconcile]
+admin_key_command = ""   # a command run outside any fence whose first line of output is an Admin API key (sk-ant-admin01-..., from the Console's Admin keys page; not offered to individual accounts); not the key the runs spend
+api_key_ids = []         # the apikey_... ids of the keys the runs spend; while it is empty, --reconcile lists the organisation's keys (id, name, partial_key_hint) and refuses
+tolerance = 0.05         # dollars, per bucket: provider spend above the runs' by more than this is "over", and provider spend with no run active above it is "unaccounted"
+
 [factors]
 "claude-haiku-5-5" = 1   # CLI 2.1.284 priced this model at another model's rates and needed 40 here; CLI 2.1.296 prices it truly. On 2.1.284 set 40 in your config.toml
 

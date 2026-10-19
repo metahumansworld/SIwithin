@@ -33,14 +33,14 @@ Findings from the launcher this grew out of, each made on a real CLI and kept be
 """
 from __future__ import annotations
 
-import argparse, copy, datetime, hashlib, http.client, http.server, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, socketserver, ssl, subprocess, sys, threading, time, urllib.parse
+import argparse, copy, csv, datetime, hashlib, http.client, http.server, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, socketserver, ssl, subprocess, sys, threading, time, urllib.parse
 from types import SimpleNamespace
 
 try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 LOG_BIN = "/usr/bin/log"  # absolute, like SANDBOX_EXEC: reads the kernel's sandbox report for the run's network mark once the run has ended; a module constant, so a test can stand a shim in
 LOG_WAIT = 2.0  # seconds between the CLI's end and each of the two reads of that report: the kernel coalesces repeated reports and lands its "N duplicate reports" line up to about two seconds after the first, seen live on 15 October 2026, so the report is read twice, LOG_WAIT apart, and the second read's figures stand
@@ -85,6 +85,7 @@ DEFAULT_CONFIG = {
         "read_on": "2026-10-13",
         "source": "platform.claude.com/docs/en/about-claude/pricing; developers.openai.com/api/docs/pricing",
         "web_search": 0.01,
+        "cache_write_1h_factor": 1.6,  # --reconcile: a one-hour cache write over the five-minute rate above; 2.0x over 1.25x the input rate, read on 18 October 2026 at platform.claude.com/docs/en/about-claude/pricing
         "claude-haiku-5-5": [0.10, 0.125, 0.01, 0.50],
         "claude-sonnet-5-5": [2.0, 2.5, 0.10, 10.0],
         "claude-opus-5-5": [4.0, 5.0, 0.20, 20.0],
@@ -92,6 +93,8 @@ DEFAULT_CONFIG = {
         "gpt-5.3-codex": [1.75, 1.75, 0.175, 14.0],
         "gpt-6.1-sol": [2.0, 2.0, 0.10, 10.0],
     },
+    # --reconcile, the provider's usage report against the ledger: a command that prints an Admin API key, the ids of the keys the runs spend, dollars of slack per bucket.
+    "reconcile": {"admin_key_command": "", "api_key_ids": [], "tolerance": 0.05},
     # CLI budget units per true dollar. CLI 2.1.284 priced this model at Opus rates and needed 40 here; CLI 2.1.296 prices it truly, so 1.
     # On 2.1.284 a user sets 40 under [factors] in config.toml.
     "factors": {"claude-haiku-5-5": 1},
@@ -1684,12 +1687,457 @@ def run_cli(P, cfg, proxy):
     return 0 if status == "done" else 1
 
 
+# ---- reconcile: the provider's bill against the ledger; a reading of records, it runs nothing ---------------------------------------------
+
+UTC = datetime.timezone.utc
+WIDTHS = {"1m": datetime.timedelta(minutes=1), "1h": datetime.timedelta(hours=1), "1d": datetime.timedelta(days=1)}
+PAGE_MAX = {"1m": 1440, "1h": 168, "1d": 31}  # the most buckets a page holds: the Usage and Cost API page, read on 18 October 2026
+USAGE_PATH, KEYS_PATH = "/v1/organizations/usage_report/messages", "/v1/organizations/api_keys"
+RECONCILE_GROUP = ("api_key_id", "model", "service_tier")
+RECONCILE_PAGES = 2000  # a listing still going after this many pages is a fault, not a long report
+RECONCILE_TIMEOUT = 60  # seconds one request to the provider may take
+TOKEN_KINDS = ("unc", "read", "w5", "w1", "out", "web")  # uncached input, cache read, 5-minute cache write, 1-hour cache write, output, web searches
+WATCH_SLEEP = time.sleep  # a module constant, so a test can stand a clock in
+FIGURES = ("provider", "runs", "unaccounted", "unaccounted_buckets", "over", "over_buckets", "unpriced")  # what --every compares between two looks
+
+
+def parse_when(text, what):
+    """A date or a date and time in the machine's local zone, as the ledger's lines are."""
+    m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d)(?::(\d\d))?)?", text.strip())
+    try:
+        if not m: raise ValueError(text)
+        return datetime.datetime(*(int(g or 0) for g in m.groups()))
+    except ValueError: raise Refused(f"{what}: {text!r} is not a date (2026-10-16) or a date and time (2026-10-16T18:00)")
+
+
+def utc_of(t): return t.astimezone(UTC)  # a naive time is the machine's local time
+
+
+def iso_z(t): return utc_of(t).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_rfc3339(s):
+    try: return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError: raise Refused(f"the usage report has a time that is not RFC 3339: {str(s)[:40]!r}")
+
+
+def floor_to(t, width):
+    t = t.replace(second=0, microsecond=0)
+    return t.replace(minute=0) if width == "1h" else t.replace(hour=0, minute=0) if width == "1d" else t
+
+
+def ceil_to(t, width):
+    f = floor_to(t, width)
+    return f if f == t else f + WIDTHS[width]
+
+
+def usage_pairs(start, end, width, ids):
+    return ([("starting_at", iso_z(start)), ("ending_at", iso_z(end)), ("bucket_width", width), ("limit", str(PAGE_MAX[width]))]
+            + [("api_key_ids[]", i) for i in ids] + [("group_by[]", g) for g in RECONCILE_GROUP])
+
+
+class AdminAPI:
+    """The usage report and the key listing, read with the Admin API key. The key lives in this object and goes into the request header and nowhere else."""
+
+    def __init__(self, key, upstream):
+        self._key, u = key, upstream
+        self.https, self.host, self.port, self.base = u.scheme == "https", u.hostname, u.port or (443 if u.scheme == "https" else 80), u.path.rstrip("/")
+        self.netloc = f"{u.scheme}://{u.netloc}"
+
+    def __repr__(self): return f"AdminAPI({self.host})"  # never the key
+
+    def headers(self, shown=False):
+        return {"x-api-key": "<key>" if shown or self._key is None else self._key, "anthropic-version": "2023-06-01", "User-Agent": f"{NAME}/{VERSION}"}
+
+    def url(self, path, pairs): return f"{self.netloc}{self.base}{path}?{urllib.parse.urlencode(pairs, safe='[]:')}"
+
+    def scrub(self, text):
+        """One line, with the key and any string that begins sk-ant replaced by <key>."""
+        if self._key: text = text.replace(self._key, "<key>")
+        return " ".join(re.sub(r"sk-ant\S*", "<key>", text).split())
+
+    def failure(self, status, body):
+        kind = msg = ""
+        try: e = json.loads(body).get("error")
+        except (ValueError, AttributeError): e = None
+        if isinstance(e, dict): kind, msg = str(e.get("type") or ""), str(e.get("message") or "")
+        return self.scrub(f"{self.host} answered {status}" + (f": {kind}" if kind else "") + (f": {msg}" if msg else ""))[:400]
+
+    def get(self, path, pairs):
+        conn = (http.client.HTTPSConnection(self.host, self.port, timeout=RECONCILE_TIMEOUT, context=ssl.create_default_context()) if self.https
+                else http.client.HTTPConnection(self.host, self.port, timeout=RECONCILE_TIMEOUT))
+        try:
+            conn.request("GET", self.base + path + "?" + urllib.parse.urlencode(pairs, safe="[]:"), headers=self.headers())
+            resp = conn.getresponse()
+            status, body = resp.status, resp.read(64 << 20)
+        except (OSError, http.client.HTTPException) as x: raise Refused(f"the request to {self.host} failed ({type(x).__name__})")  # the type, never the text: nothing of the request goes in it
+        finally: conn.close()
+        if status != 200: raise Refused(self.failure(status, body))
+        try: j = json.loads(body)
+        except ValueError: j = None
+        if not isinstance(j, dict): raise Refused(f"{self.host} answered 200 with a body that is not a JSON object")
+        return j
+
+    def list_keys(self):
+        keys, after = [], None
+        for _ in range(RECONCILE_PAGES):
+            j = self.get(KEYS_PATH, [("limit", "1000")] + ([("after_id", after)] if after else []))
+            keys += [k for k in j.get("data") or [] if isinstance(k, dict)]
+            after = j.get("last_id")
+            if not j.get("has_more") or not after: return keys
+        raise Refused("the key listing did not end")
+
+    def usage(self, start, end, width, ids):
+        """Every bucket of the report, pages joined."""
+        buckets, page, seen = [], None, set()
+        for _ in range(RECONCILE_PAGES):
+            j = self.get(USAGE_PATH, usage_pairs(start, end, width, ids) + ([("page", page)] if page else []))
+            if not isinstance(j.get("data") or [], list): raise Refused("the usage report's data is not a list")
+            buckets += j.get("data") or []
+            page = j.get("next_page")
+            if not j.get("has_more") or not isinstance(page, str) or not page: return buckets
+            if page in seen: raise Refused("the usage report's next_page repeated")
+            seen.add(page)
+        raise Refused("the usage report did not end")
+
+
+def upstream_parts(upstream):
+    u = urllib.parse.urlsplit(upstream)
+    try: u.port
+    except ValueError: u = urllib.parse.urlsplit("")
+    if u.scheme not in ("http", "https") or not u.hostname or (u.scheme == "http" and u.hostname not in ("127.0.0.1", "localhost", "::1")):
+        raise Refused(f"auth: upstream {upstream!r} must be an https:// address (http:// only for a loopback host): the admin key is sent there")
+    return u
+
+
+def read_admin_key(cmd):
+    """The first line printed by [reconcile] admin_key_command, run outside any fence; its stderr is the terminal's."""
+    try: r = subprocess.run(cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as x: raise Refused(f"reconcile: [reconcile] admin_key_command could not be run ({type(x).__name__})")
+    if r.returncode != 0: raise Refused(f"reconcile: [reconcile] admin_key_command exited {r.returncode}")
+    k = (r.stdout.splitlines() or [""])[0].strip()
+    if not k: raise Refused("reconcile: [reconcile] admin_key_command printed no key on its first line")
+    if not re.fullmatch(r"[\x21-\x7e]+", k): raise Refused("reconcile: the admin key has a character that cannot go in a header")
+    return k
+
+
+def reconcile_settings(cfg):
+    r, prices = cfg["reconcile"], cfg["prices"]
+    if not isinstance(r, dict): raise Refused("config.toml: [reconcile] must be a table")
+    cmd, ids, tol, fac = r.get("admin_key_command"), r.get("api_key_ids"), r.get("tolerance"), prices.get("cache_write_1h_factor")
+    real_num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not isinstance(cmd, str): raise Refused("config.toml: [reconcile] admin_key_command must be a string")
+    if not (isinstance(ids, list) and all(isinstance(i, str) and re.fullmatch(r"[\x21-\x7e]+", i) for i in ids)): raise Refused("config.toml: [reconcile] api_key_ids must be a list of key ids")
+    if not (real_num(tol) and tol >= 0): raise Refused("config.toml: [reconcile] tolerance must be a finite number, zero or above")
+    if not (real_num(fac) and fac > 0): raise Refused("config.toml: [prices] cache_write_1h_factor must be a finite number above zero")
+    return SimpleNamespace(cmd=cmd.strip(), ids=list(ids), tol=float(tol))
+
+
+def count(x): return int(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0 else 0  # a missing or odd field reads as zero
+
+
+def result_row(r):
+    cc, st, model, tier = r.get("cache_creation"), r.get("server_tool_use"), r.get("model"), r.get("service_tier")
+    cc, st = cc if isinstance(cc, dict) else {}, st if isinstance(st, dict) else {}
+    return {"model": model if isinstance(model, str) and model else "unknown", "tier": tier if isinstance(tier, str) and tier else "standard",
+            "unc": count(r.get("uncached_input_tokens")), "read": count(r.get("cache_read_input_tokens")), "w5": count(cc.get("ephemeral_5m_input_tokens")),
+            "w1": count(cc.get("ephemeral_1h_input_tokens")), "out": count(r.get("output_tokens")), "web": count(st.get("web_search_requests"))}
+
+
+def provider_cost(prices, row):
+    """Dollars at the [prices] rates, None when the model has no price. A service tier other than standard is priced as standard: its tier is shown beside it."""
+    p = prices.get(row["model"])
+    if not (isinstance(p, list) and len(p) == 4): return None
+    return ((row["unc"] * p[0] + row["w5"] * p[1] + row["w1"] * p[1] * prices["cache_write_1h_factor"] + row["read"] * p[2] + row["out"] * p[3]) / 1e6
+            + row["web"] * float(prices.get("web_search") or 0))
+
+
+def add_row(out, bucket, row, prices):
+    if not any(row[k] for k in TOKEN_KINDS): return  # a row with nothing in it is the report's empty interval
+    row["dollars"] = provider_cost(prices, row)
+    out.setdefault(bucket, []).append(row)
+
+
+def read_buckets(data, prices, start, end, width):
+    """{bucket start: [row]} from the report's buckets, those inside [start, end) only."""
+    out = {}
+    for b in data:
+        if not isinstance(b, dict) or "starting_at" not in b: raise Refused("the usage report has a bucket with no starting_at")
+        s = floor_to(parse_rfc3339(b["starting_at"]), width)
+        if not start <= s < end: continue
+        for r in b.get("results") or []:
+            if isinstance(r, dict): add_row(out, s, result_row(r), prices)
+    return out
+
+
+def api_fetch(api, ids, width, prices):
+    def fetch(start, end):  # one bucket past the end is asked for, so a reading of "ends before" that drops the last bucket cannot drop one that is wanted
+        return read_buckets(api.usage(start, end + WIDTHS[width], width, ids), prices, start, end, width)
+    return fetch
+
+
+def ledger_runs(home):
+    """[(start, minutes, true dollars, run folder name)] for the ledger's lines; the start is the line's own, local time."""
+    out = []
+    try:
+        with open(os.path.join(home, "ledger.md"), encoding="utf-8", errors="replace") as f: lines = f.read().split("\n")
+    except OSError: return out
+    for ln in lines:
+        m, c = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d) \| ", ln), re.search(r"\| true \$([0-9]+(?:\.[0-9]+)?)", ln)
+        if not (m and c): continue
+        try: t0 = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+        except ValueError: continue
+        parts, mins = RECEIPT_TAIL.sub("", ln).split(" | "), re.search(r"\| ([0-9]+(?:\.[0-9]+)?) min \|", ln)
+        out.append((t0, float(mins.group(1)) if mins else 0.0, float(c.group(1)), parts[-2][5:] if len(parts) > 2 and parts[-2].startswith("runs/") else ""))
+    return out
+
+
+def run_requests(home, name):
+    """[(local time, dollars)] for each request the key proxy forwarded, as it priced it; None when the run has no readable proxy.jsonl (another adapter, the 0.1 ledger, a folder that is gone)."""
+    if not name or name in (".", "..") or "/" in name: return None
+    out = []
+    try:
+        with open(os.path.join(home, "runs", name, PROXY_LOG), encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                try: e = json.loads(ln); t = datetime.datetime.fromisoformat(e["t"])
+                except (ValueError, KeyError, TypeError): continue
+                if e.get("refused") is None: out.append((t, float(e["cost"]) if isinstance(e.get("cost"), (int, float)) and not isinstance(e.get("cost"), bool) else 0.0))
+    except OSError: return None
+    return out
+
+
+def place_runs(home, start, end, width):
+    """The runs' side: {bucket: {dollars, requests, lines}} and the buckets a run was active in. A run with a proxy log is placed request by request, by each request's own time;
+    one without is placed whole, by its line's time. A run is active from its line's time for its minutes and one more."""
+    placed, active, step = {}, set(), WIDTHS[width]
+    slot = lambda k: placed.setdefault(k, {"dollars": 0.0, "requests": 0, "lines": 0})
+    for t0, mins, true, name in ledger_runs(home):
+        a = utc_of(t0)
+        b = a + datetime.timedelta(minutes=mins + 1)
+        if a >= end or b < start: continue
+        k = floor_to(max(a, start), width)
+        while k < min(b, end): active.add(k); k += step
+        reqs = run_requests(home, name)
+        if reqs is None:
+            k = floor_to(a, width)
+            if start <= k < end: s = slot(k); s["dollars"] += true; s["lines"] += 1
+            continue
+        for t, cost in reqs:
+            k = floor_to(utc_of(t), width)
+            if start <= k < end: s = slot(k); s["dollars"] += cost; s["requests"] += 1; active.add(k)
+    return placed, active
+
+
+def compare(provider, placed, active, tol):
+    """One row per bucket with provider spend or a run's: unaccounted (provider spend, no run active, no request logged), over (provider above the runs by more than tol), ok."""
+    rows = []
+    for k in sorted(set(provider) | set(placed)):
+        res, run = provider.get(k, []), placed.get(k) or {"dollars": 0.0, "requests": 0, "lines": 0}
+        pd, rd = round(sum(r["dollars"] or 0.0 for r in res), 4), round(run["dollars"], 4)
+        unpriced, busy, diff = any(r["dollars"] is None for r in res), k in active or bool(run["requests"] or run["lines"]), round(pd - rd, 4)
+        verdict = "unaccounted" if not busy and res and (pd > tol or unpriced) else "over" if busy and diff > tol else "ok"
+        rows.append({"bucket": iso_z(k), "provider": pd, "runs": rd, "difference": diff, "verdict": verdict, "unpriced": unpriced, "tiers": sorted({r["tier"] for r in res if r["tier"] != "standard"}),
+                     "by_line": run["lines"], "requests": run["requests"], "results": res})
+    return rows
+
+
+def reconcile_totals(rows):
+    un, ov = [r for r in rows if r["verdict"] == "unaccounted"], [r for r in rows if r["verdict"] == "over"]
+    return {"provider": round(sum(r["provider"] for r in rows), 4), "runs": round(sum(r["runs"] for r in rows), 4), "unaccounted": round(sum(r["provider"] for r in un), 4), "unaccounted_buckets": len(un),
+            "over": round(sum(r["difference"] for r in ov), 4), "over_buckets": len(ov), "unpriced": sum(1 for r in rows if r["unpriced"]), "tier_buckets": sum(1 for r in rows if r["tiers"])}
+
+
+def summary_line(since, until, t, ids):
+    shown = ", ".join(k[:11] + ("…" if len(k) > 11 else "") for k in ids) or "-"
+    return (f"reconcile: {since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M} | provider ${t['provider']:.4f} | runs ${t['runs']:.4f} | unaccounted ${t['unaccounted']:.4f} in {t['unaccounted_buckets']} buckets"
+            f" | over ${t['over']:.4f} in {t['over_buckets']} | unpriced {t['unpriced']} | key {shown}")
+
+
+def reconcile_findings(rows):
+    """The lines before the summary: each bucket that is not ok, the tiers other than standard, the models with no price."""
+    out = [f"{r['verdict']}: {r['bucket']} provider ${r['provider']:.4f}, runs ${r['runs']:.4f}" for r in rows if r["verdict"] != "ok"]
+    tiers, models = sorted({t for r in rows for t in r["tiers"]}), sorted({x["model"] for r in rows for x in r["results"] if x["dollars"] is None})
+    if tiers: out.append(f"finding: service tier {', '.join(tiers)} in {sum(1 for r in rows if r['tiers'])} buckets, priced as standard: the runs use the standard tier, so this spend is not theirs")
+    if models: out.append(f"unpriced: {', '.join(models)} has no price in [prices]: its tokens are in the report, its dollars are in no figure")
+    return out
+
+
+def reconcile_text(since, until, width, source, rows, line):
+    out = [f"# {NAME} reconcile: {since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M} local, {width} buckets, bucket times in UTC", "", f"source: {source}", "",
+           "| bucket (UTC) | provider $ | runs $ | difference $ | verdict | notes |", "|---|---|---|---|---|---|"]
+    for r in rows:
+        notes = ([f"tier {', '.join(r['tiers'])}"] if r["tiers"] else []) + (["unpriced"] if r["unpriced"] else []) + ([f"by line ({r['by_line']})"] if r["by_line"] else []) + ([f"{r['requests']} requests logged"] if r["requests"] else [])
+        out.append(f"| {r['bucket']} | {r['provider']:.4f} | {r['runs']:.4f} | {r['difference']:+.4f} | {r['verdict']} | {'; '.join(notes)} |")
+    out += ["", "## the provider's results", "", "| bucket (UTC) | model | tier | uncached | cache read | cache write 5m | cache write 1h | output | searches | $ |", "|---|---|---|---|---|---|---|---|---|---|"]
+    out += [f"| {r['bucket']} | {x['model']} | {x['tier']} | {x['unc']} | {x['read']} | {x['w5']} | {x['w1']} | {x['out']} | {x['web']} | {'unpriced' if x['dollars'] is None else format(x['dollars'], '.4f')} |"
+            for r in rows for x in r["results"]]
+    return "\n".join(out + ["", line, ""])
+
+
+def save_reconcile(home, text, data):
+    """<home>/reconcile/<UTC stamp>.md and the same figures as .json beside it; the path of the first."""
+    folder = os.path.join(home, "reconcile")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    stamp, n = datetime.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"), 0
+    while True:
+        base = os.path.join(folder, stamp + (f"-{n}" if n else ""))
+        try: f = open(base + ".md", "x", encoding="utf-8"); break
+        except FileExistsError: n += 1
+    with f: f.write(text)
+    with open(base + ".json", "w", encoding="utf-8") as g: json.dump(data, g, indent=1)
+    return base + ".md"
+
+
+def cell(s, row, col):
+    try: return float(s.replace(",", "") or 0) if s.strip() else 0.0
+    except ValueError: raise Refused(f"csv: row {row}: {s.strip()[:30]!r} in column {col!r} is not a number")
+
+
+def csv_columns(header):
+    """{field: column index} found by name, case-insensitively; (columns, the names of the required fields not found)."""
+    names = [re.sub(r"[\s_\-]+", " ", h.strip().lower()) for h in header]
+    first = lambda *words, skip=(): next((i for i, n in enumerate(names) if any(w in n for w in words) and not any(w in n for w in skip)), None)
+    made = [i for i, n in enumerate(names) if "cache creation" in n]
+    five, hour = next((i for i in made if "5m" in names[i]), None), next((i for i in made if "1h" in names[i]), None)
+    plain = next((i for i in made if i not in (five, hour)), None)
+    cols = {"time": first("bucket", "hour", "time", "date"), "model": first("model"), "unc": first("uncached"), "read": first("cache read"), "w5": five if five is not None or hour is not None else plain,
+            "w1": hour, "out": first("output"), "tier": first("tier"), "web": first("web search")}
+    need = {"time": "a time (date, time, hour or bucket)", "model": "model", "unc": "uncached", "read": "cache read", "w5": "cache creation", "out": "output"}
+    return cols, [w for k, w in need.items() if cols[k] is None]
+
+
+def csv_time(s, row):
+    m = re.search(r"(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d))?", s)
+    if not m: raise Refused(f"csv: row {row}: no date in {s.strip()[:30]!r}")
+    return datetime.datetime(*(int(g or 0) for g in m.groups()), tzinfo=UTC)  # the export's times are read as UTC, as the API's are
+
+
+def read_usage_csv(path):
+    """([(bucket time, row)], the width the file has): the Console's usage export, its columns found by name; a header with a column missing is printed as it is and refused."""
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f: lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError) as x: raise Refused(f"csv: {path} cannot be read ({type(x).__name__})")
+    table = list(csv.reader(lines))
+    cols, missing = csv_columns(table[0]) if table else ({}, ["a header row"])
+    if missing: raise Refused(f"csv: {path} has no column for {', '.join(missing)}; the header row is: {lines[0] if lines else ''}")
+    rows, width = [], "1d"
+    for i, rec in enumerate(table[1:], 2):
+        if not any(c.strip() for c in rec): continue
+        if len(rec) <= max(c for c in cols.values() if c is not None): raise Refused(f"csv: row {i} has {len(rec)} columns, fewer than the header's")
+        t = csv_time(rec[cols["time"]], i)
+        width = "1m" if t.minute or width == "1m" else "1h" if t.hour else width
+        get = lambda k: cell(rec[cols[k]], i, table[0][cols[k]]) if cols[k] is not None else 0.0
+        tier = rec[cols["tier"]].strip().lower() if cols["tier"] is not None else ""
+        rows.append((t, {"model": rec[cols["model"]].strip() or "unknown", "tier": tier or "standard", **{k: count(get(k)) for k in ("unc", "read", "w5", "w1", "out", "web")}}))
+    return rows, width
+
+
+def csv_fetch(rows, width, prices):
+    def fetch(start, end):
+        out = {}
+        for t, row in rows:
+            k = floor_to(t, width)
+            if start <= k < end: add_row(out, k, dict(row), prices)
+        return out
+    return fetch
+
+
+def reconcile_dry_run(o, S, api, start, end, width, since, until):
+    print("== reconcile (a dry run: nothing is requested, no key is read, nothing is written) ==")
+    print(f"period: {since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M} local; {iso_z(start)} to {iso_z(end)} UTC, {width} buckets")
+    if o.csv: print(f"source: {o.csv}, the Console's usage export, columns found by name"); return 0
+    print("admin key: the first line printed by [reconcile] admin_key_command, which a real run runs outside any fence")
+    if S.ids: path, pairs = USAGE_PATH, usage_pairs(start, end + WIDTHS[width], width, S.ids)
+    else: path, pairs = KEYS_PATH, [("limit", "1000")]; print("[reconcile] api_key_ids is empty: a real run lists the keys with this request and refuses")
+    print(f"GET {api.url(path, pairs)}")
+    for k, v in api.headers(shown=True).items(): print(f"{k}: {v}")
+    return 0
+
+
+def refuse_with_keys(api):
+    """Print id, name and partial_key_hint of each key, nothing else, and refuse: which key is the runs' is the owner's to say."""
+    keys = api.list_keys()
+    for k in keys: print(f"{k.get('id')} | {k.get('name')} | {k.get('partial_key_hint')}")
+    raise Refused("[reconcile] api_key_ids is empty: put the id of the key the runs spend in config.toml, as api_key_ids = [\"<one of the ids above>\"]" if keys
+                  else "[reconcile] api_key_ids is empty and the organisation lists no keys")
+
+
+def reconcile_watch(every, once, save):
+    """Look again every `every` seconds; print the summary line only when a figure changed; exit 1 at the first unaccounted above the tolerance."""
+    seen = None
+    try:
+        while True:
+            rows, t, line = once(datetime.datetime.now())
+            if tuple(t[k] for k in FIGURES) != seen: seen = tuple(t[k] for k in FIGURES); save(rows, t, line, datetime.datetime.now()); print(line, flush=True)
+            if t["unaccounted_buckets"]: return 1
+            WATCH_SLEEP(every)
+    except KeyboardInterrupt: return 0
+
+
+def reconcile(o, home):
+    cfg = load_config(home)[0]
+    S, prices = reconcile_settings(cfg), cfg["prices"]
+    since = parse_when(o.reconcile, "--reconcile")
+    if o.every is not None:
+        if o.until: raise Refused("--every looks up to now each time: it takes no --until")
+        if o.csv: raise Refused("--every polls the provider: it takes no --csv")
+        if o.every < 60: raise Refused("--every must be at least 60 seconds: the usage report allows a poll a minute")
+    until = parse_when(o.until, "--until") if o.until else datetime.datetime.now()
+    if since >= until: raise Refused("--reconcile: SINCE is not before UNTIL")
+    if not o.csv and not S.cmd:
+        raise Refused("reconcile: no way to read the provider's figures: set [reconcile] admin_key_command in config.toml (a command that prints an Admin API key), or pass --csv FILE (the Console's usage export)")
+    up = upstream_parts(cfg["auth"]["upstream"])
+    width, ids, source = o.bucket or "1h", S.ids, f"{o.csv} (the Console's usage export)" if o.csv else f"the usage report at {up.netloc}"
+    if o.csv and not o.dry_run:
+        rows, fw = read_usage_csv(o.csv)
+        if o.bucket and list(WIDTHS).index(o.bucket) < list(WIDTHS).index(fw): raise Refused(f"csv: the file's rows are {fw} wide; --bucket {o.bucket} is finer than the file has")
+        width, ids = o.bucket or fw, []
+        fetch = csv_fetch(rows, width, prices)
+    if o.dry_run: return reconcile_dry_run(o, S, AdminAPI(None, up), floor_to(utc_of(since), width), ceil_to(utc_of(until), width), width, since, until)
+    if not o.csv:
+        api = AdminAPI(read_admin_key(S.cmd), up)
+        if not ids: refuse_with_keys(api)
+        fetch = api_fetch(api, ids, width, prices)
+
+    def once(at):
+        start, end = floor_to(utc_of(since), width), ceil_to(utc_of(at), width)
+        rows = compare(fetch(start, end), *place_runs(home, start, end, width), S.tol)
+        t = reconcile_totals(rows)
+        return rows, t, summary_line(since, at, t, ids)
+
+    def save(rows, t, line, at):
+        data = {"period": {"since": since.isoformat(timespec="minutes"), "until": at.isoformat(timespec="minutes"), "zone": "local"}, "bucket": width, "source": source, "keys": ids,
+                "tolerance": S.tol, "buckets": rows, "totals": t, "summary": line}
+        return save_reconcile(home, reconcile_text(since, at, width, source, rows, line), data)
+
+    if o.every is not None: return reconcile_watch(o.every, once, save)
+    rows, t, line = once(until)
+    path = save(rows, t, line, until)
+    for ln in reconcile_findings(rows): print(ln)
+    print(f"report: {path}\n{line}")
+    return 1 if t["unaccounted_buckets"] or t["over_buckets"] else 0
+
+
+def reconcile_command(o, home):
+    """Exit 0 when nothing is unaccounted or over, 1 when something is, 2 when reconcile could not run, with one line saying why."""
+    if hasattr(sys.stdout, "reconfigure"): sys.stdout.reconfigure(errors="replace")  # the summary line carries an ellipsis: a terminal that cannot show it must not stop the run
+    try: return reconcile(o, home)
+    except Refused as x:
+        print(f"refused: {x}", file=sys.stderr, flush=True)
+        return 2
+
+
 def parse_args(argv):
     a = argparse.ArgumentParser(prog=NAME, description="Run an agent CLI headless on a brief (stdin), inside a folder fence, under a dollar budget and a cap.")
     add = a.add_argument
-    add("--dir", help="the run's folder: writable unless --readonly, the CLI works in it (required unless --verify)")
+    add("--dir", help="the run's folder: writable unless --readonly, the CLI works in it (required unless --verify or --reconcile)")
     add("--verify", nargs="?", const=True, metavar="RUN", help="check the ledger's receipts, or one run folder's files against its receipt; runs nothing")
     add("--expect", metavar="HASH", help="with --verify: fail unless the last receipt on the ledger is this hash (keep it somewhere the ledger's writer cannot reach)")
+    add("--reconcile", metavar="SINCE", help="compare the provider's usage report for the configured keys with what the runs account for, from SINCE (2026-10-16 or 2026-10-16T18:00, local time); runs nothing")
+    add("--until", metavar="UNTIL", help="with --reconcile: the end of the period, as SINCE is written (default now)")
+    add("--bucket", choices=list(WIDTHS), help="with --reconcile: the width of the buckets compared (default 1h, or the width of the --csv file)")
+    add("--csv", metavar="FILE", help="with --reconcile: read the Console's usage export instead of calling the API, for an account with no Admin API key")
+    add("--every", type=int, metavar="SECONDS", help="with --reconcile: look again every SECONDS (at least 60), print a line when a figure changes, exit 1 at the first unaccounted spend")
     add("--read", action="append", default=[], help="a folder the run may read, repeatable")
     add("--readonly", action="store_true", help="the run's folder is readable only")
     add("--network", choices=list(NET_MODES), help="the run's sockets: proxy (only the key proxy's loopback port; the default from [fence] network), report (open, every socket counted: a survey), open (unreported)")
@@ -1710,7 +2158,9 @@ def parse_args(argv):
     add("--dry-run", action="store_true", help="print the command, the fence, the checks and the budget arithmetic; run nothing")
     add("--version", action="version", version=f"{NAME} {VERSION}")
     o = a.parse_args(argv)
-    if not o.dir and not o.verify: a.error("--dir is required")
+    if o.reconcile is not None and (o.dir or o.verify): a.error("--reconcile reads records and runs nothing: it takes no --dir and no --verify")
+    if o.reconcile is None and any(x is not None for x in (o.until, o.bucket, o.csv, o.every)): a.error("--until, --bucket, --csv and --every go with --reconcile")
+    if not o.dir and not o.verify and o.reconcile is None: a.error("--dir is required")
     if o.expect is not None and o.verify is not True: a.error("--expect goes with --verify alone: it checks the ledger's last receipt, not a run folder")
     return o
 
@@ -1722,6 +2172,7 @@ def main(argv=None):
         home = derive_home()
         siwithin_home = real(o.home) if o.home else os.path.join(home, ".config", NAME)
         if o.verify: return verify_ledger(siwithin_home, o.expect) if o.verify is True else verify_folder(o.verify)  # no lock, no config
+        if o.reconcile is not None: return reconcile_command(o, siwithin_home)  # no lock, no fence, no ledger line: a reading of records
         cfg, cfg_path, present, problems = load_config(siwithin_home)
         brief = sys.stdin.read() if (sys.stdin is not None and not sys.stdin.isatty()) else None
         now = datetime.datetime.now()
