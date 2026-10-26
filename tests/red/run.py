@@ -44,7 +44,7 @@ DEFAULT_TIMEOUT = "120"
 # would kill the run before its program had started; the 120-second timeout stops the 40-part task with the program running, and the walk runs on the timer's stop as on the budget's (14 October 2026)
 WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash")
 REFUSED = re.compile(r"operation not permitted", re.I)
-NET_WALL = re.compile(r"operation not permitted|nodename nor servname|\[errno (?:1|8)\]", re.I)  # a socket the fence refused, as Python reports it: errno 1 on connect, errno 8 from the resolver when its socket is refused
+NET_WALL = re.compile(r"operation not permitted|nodename nor servname|\[errno (?:1|8)\]|network is unreachable|errno 101|temporary failure in name resolution|errno -3", re.I)  # a socket the fence refused, as Python reports it: errno 1 on connect, errno 8 from the resolver when its socket is refused (macOS); on Linux errno 101, network is unreachable, measured on 24 October 2026 in a bubblewrap namespace with no route out; temporary failure in name resolution and errno -3 are unmeasured, what a lookup with no resolver reachable should say
 RC_NOISE = re.compile(r"\.(zshenv|zshrc|zprofile|zlogin|bashrc|bash_profile|profile)\b")  # the shell's rc files refuse their own reads inside the fence, on every Bash result
 
 

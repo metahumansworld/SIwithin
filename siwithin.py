@@ -8,7 +8,7 @@ Usage: python3 siwithin.py --dir <folder> [--adapter claude|codex] [--model M] [
        [--home <folder>] [--dry-run] < brief
        siwithin.py --verify [<run folder>] [--expect <hash>] [--home <folder>]
 The brief comes on stdin. The tool's home (default ~/.config/siwithin) holds config.toml, cap, ledger.md, lock and runs/; each run's folder under
-runs/ gets the brief, the command, the fence profile, the CLI's events and stderr, result.md, summary.json and receipt.json. macOS only in v0.1.
+runs/ gets the brief, the command, the fence profile (on Linux, bubblewrap's arguments), the CLI's events and stderr, result.md, summary.json and receipt.json. macOS (sandbox-exec) or Linux (bubblewrap).
 The receipt, written by the runner after the CLI has exited, holds the sha256 of each file the runner wrote, the hash of the ledger as it stood and the previous
 receipt's hash; the ledger line carries the receipt's own hash, and --verify checks the files and the chain against it.
 
@@ -40,15 +40,21 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
+BWRAP = "/usr/bin/bwrap"  # Linux's fence: absolute and a module constant, for the reasons SANDBOX_EXEC is
+SOCAT = "/usr/bin/socat"  # Linux, network = "proxy": the bridge from the run's loopback port to the key proxy's Unix socket, started inside the run's network namespace
+PLATFORM = sys.platform  # read once; a test sets it to "linux" to drive the Linux path under a shim on macOS
 LOG_BIN = "/usr/bin/log"  # absolute, like SANDBOX_EXEC: reads the kernel's sandbox report for the run's network mark once the run has ended; a module constant, so a test can stand a shim in
 LOG_WAIT = 2.0  # seconds between the CLI's end and each of the two reads of that report: the kernel coalesces repeated reports and lands its "N duplicate reports" line up to about two seconds after the first, seen live on 15 October 2026, so the report is read twice, LOG_WAIT apart, and the second read's figures stand
 NET_MODES = ("proxy", "report", "open")  # [fence] network: only the key proxy's port; open and every socket reported; open and unreported
 UNCONFIRMED = "unconfirmed"  # an adapter field holding this is a stub: any option that needs it is refused, naming the field
-ROADMAP = "README.md, 'What v0.1 does not do'"
+ROADMAP = "README.md, 'What it does not do'"
 PROXY_TAG = "SIwithin"  # the name the key proxy's error bodies carry; change it with NAME
 PRICE_STALE_DAYS = 90
+FENCE_HEAD = f"# bubblewrap arguments for {NAME}; the macOS counterpart is a sandbox-exec profile"  # the first line of fence.sb on Linux; the arguments follow, one to a line
+PROXY_SOCK = f"/tmp/{NAME}-proxy.sock"  # where the key proxy's Unix socket is bound into the run's namespace (Linux, network = "proxy")
+LINUX_NET_NOTE = "Linux: the namespace has no route out, so a refused socket fails at connect (errno 101) and is not counted; no kernel report"
 
 
 class Refused(Exception):
@@ -130,6 +136,13 @@ DEFAULT_CONFIG = {
             "aliases": {},
         },
     },
+}
+# The [fence] keys that differ on Linux, laid over the defaults above when the platform is Linux (config.toml still wins). deny_write is read there for the dry run's text only: the whole tree is read-only under bubblewrap.
+LINUX_FENCE = {
+    "read_home": [".cache", ".gitconfig", ".config/git"],
+    "write_home": [".cache"],
+    "deny_write": ["/opt", "/usr/local", "/mnt", "/media", "/srv"],
+    "deny_exec": ["/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch", "/usr/bin/systemd-run", "/usr/bin/xdg-open"],
 }
 BLANK_ADAPTER = {k: ("" if isinstance(v, str) else [] if isinstance(v, list) else {} if isinstance(v, dict) else False)
                  for k, v in DEFAULT_CONFIG["adapters"]["claude"].items()}
@@ -262,6 +275,7 @@ def merge(base, new):
 
 def load_config(siwithin_home):
     cfg, path = copy.deepcopy(DEFAULT_CONFIG), os.path.join(siwithin_home, "config.toml")
+    if PLATFORM == "linux": cfg["fence"].update(copy.deepcopy(LINUX_FENCE))
     problems, present = [], os.path.isfile(path)
     if present:
         try:
@@ -627,6 +641,7 @@ def network_figures(mode, mark, messages, cli_pid):
 def network_line(n):
     """The terminal's one line on the network, from the summary's figures."""
     if n["mode"] == "open": return "network: open, unreported"
+    if n.get("note") == LINUX_NET_NOTE: return f"network: {n['mode']}; {LINUX_NET_NOTE}"
     what = f"refused {n['refused']}" if n["mode"] == "proxy" else f"reported {n['reported']}"
     top = sorted(n["targets"].items(), key=lambda kv: (-kv[1], kv[0]))[:6]
     return (f"network: {n['mode']}, {what} (cli {n['cli']}, others {n['others']})" + (": " + ", ".join(f"{t} x{c}" for t, c in top) if top else "")
@@ -667,6 +682,86 @@ def fence_profile(c):
     meta = sorted({a for p in allowed for a in ancestors(p, home)} | {home})
     out += ["; the folders above the allowed ones, metadata only", sb_rule("allow", "file-read-metadata", *[lit(p) for p in meta]), ""]
     return "\n".join(out)
+
+
+def project_dir_name(folder):
+    """The name the CLI gives a folder's transcript folder under projects/: the path with each / written as -, as on every transcript folder in the red home's config directory.
+    That settles it for a path of letters, digits, / and - only; for any other character the CLI's rule was not seen, so the name is None."""
+    return folder.replace("/", "-") if re.fullmatch(r"/[A-Za-z0-9/-]*", folder) else None
+
+
+def fence_needs(c):
+    """Linux: what a bind needs to exist before bubblewrap starts, as (directories, files) to create; a bind needs a source. Nothing is made here."""
+    dirs, files = [], []
+    if c.last_message: files.append(c.run + "/last-message.txt")
+    dirs.append(c.config_dir)
+    for p in c.fence.get("config_write", []):
+        (files if "." in p else dirs).append(os.path.join(c.config_dir, p))  # a name with a dot is a file (history.jsonl, .last-cleanup), the rest are folders
+    own = project_dir_name(c.folders[0])
+    if own: dirs.append(os.path.join(c.config_dir, "projects", own, "memory"))
+    return dirs, files
+
+
+def fence_args(c):
+    """Linux: bubblewrap's argument list for a run, from the same c as fence_profile (c.proxy_sock, when set, is the key proxy's Unix socket to bind in). The order is the order bubblewrap applies them:
+    a later bind over an earlier mount wins, as a later rule does in the profile. Pure: nothing is created (fence_needs says what is)."""
+    home, f = c.home, c.fence
+    a = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", home]  # the tree readable and not writable, a private /tmp, the home empty
+    for p in [os.path.join(home, r) for r in f["read_home"] + f["rc_files"]] + list(c.read_extra): a += ["--ro-bind-try", p, p]  # allowed back out of the empty home, each if it exists
+    for p in [os.path.join(home, w) for w in f["write_home"]] + list(c.write_extra): a += ["--bind-try", p, p]
+    for i, d in enumerate(c.folders): a += ["--bind" if i == 0 and not c.readonly else "--ro-bind", d, d]  # the run's folders: the first writable unless readonly
+    a += ["--tmpfs", c.siwithin_home]  # the tool's own home stays refused, config, cap, ledger and other runs included; back in, from the run's own folder, only:
+    if c.tmp: a += ["--bind", c.run + "/tmp", c.run + "/tmp"]
+    if c.last_message: a += ["--bind", c.run + "/last-message.txt", c.run + "/last-message.txt"]
+    a += ["--ro-bind", c.config_dir, c.config_dir]  # the CLI's config directory: readable whole, writable in its state paths only
+    for p in f.get("config_write", []): a += ["--bind", os.path.join(c.config_dir, p), os.path.join(c.config_dir, p)]
+    memory, projects = [], os.path.join(c.config_dir, "projects")
+    try: memory += [os.path.join(projects, n, "memory") for n in sorted(os.listdir(projects)) if os.path.isdir(os.path.join(projects, n, "memory"))]
+    except OSError: pass
+    own = project_dir_name(c.folders[0])
+    if own and os.path.join(projects, own, "memory") not in memory: memory.append(os.path.join(projects, own, "memory"))
+    for m in memory: a += ["--ro-bind", m, m]  # the memory folder under each transcript folder is read by the next run there, so it stays unwritable
+    for p in f["deny_exec"]:
+        if os.path.exists(p): a += ["--ro-bind", "/dev/null", p]  # starting it fails with permission denied; by path, so a copy elsewhere is not stopped
+    a += ["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--die-with-parent"]  # no --new-session: the CLI stays in the runner's process group, which the kill reaches
+    if f.get("network", "proxy") == "proxy": a.append("--unshare-net")
+    if getattr(c, "proxy_sock", False): a += ["--bind", c.run + "/proxy.sock", PROXY_SOCK]
+    for x in a:
+        if any(ord(ch) < 32 for ch in x): raise Refused(f"a path with a control character cannot go in the fence's arguments: {x!r}")
+    return a
+
+
+def fence_text(args): return FENCE_HEAD + "\n" + "\n".join(args) + "\n"
+
+
+def fence_prepare(c):
+    """Linux: make what fence_args binds from and may not find (a bind needs a source): the config directory's state paths, the run's own memory folder, the last-message file."""
+    dirs, files = fence_needs(c)
+    for d in dirs: os.makedirs(d, mode=0o700, exist_ok=True)
+    for p in files:
+        os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+        if not os.path.exists(p): open(p, "a").close()
+
+
+def fence_argv(P, cmd, port=None):
+    """The argv that runs cmd inside the fence: sandbox-exec and the profile's file on macOS; bubblewrap, its arguments and `--` (where its options end) on Linux. With the key proxy's
+    loopback port, on Linux with network = "proxy", cmd is started by a shell that first puts socat on that port inside the run's namespace, bridging it to the proxy's Unix socket."""
+    if PLATFORM != "linux": return [SANDBOX_EXEC, "-f", P.sb_path] + cmd
+    if port is not None and P.network == "proxy":
+        cmd = ["/bin/sh", "-c", f'{SOCAT} TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:{PROXY_SOCK} & exec "$0" "$@"', cmd[0]] + cmd[1:]
+    return [BWRAP] + P.fence_list + ["--"] + cmd
+
+
+def bwrap_preflight():
+    """Linux: whether bubblewrap can set up its namespaces here, by running it once on /bin/true; None when it can, else the refusal's text. It changes nothing, so a dry run does it too.
+    Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor, and its bubblewrap package ships no profile for it (measured on 24.04, 24 October 2026)."""
+    try: r = subprocess.run([BWRAP, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--", "/bin/true"],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError, ValueError) as x: return f"{BWRAP} could not be run ({type(x).__name__}): bubblewrap cannot set up its namespaces here; see README.md, Linux"
+    if r.returncode == 0: return None
+    last = ([ln.strip() for ln in r.stderr.splitlines() if ln.strip()] or [f"exit {r.returncode}"])[-1]
+    return (f"{BWRAP} said {last!r}; bubblewrap cannot set up its namespaces here; on Ubuntu 23.10 and later unprivileged user namespaces are restricted by AppArmor, and the remedy is root's: "
+            "a profile for /usr/bin/bwrap that allows userns, or sysctl kernel.apparmor_restrict_unprivileged_userns=0 for this boot; see README.md, Linux")
 
 
 def forbidden_reason(folder, home, roots):
@@ -714,10 +809,16 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     finite_money(o, cfg, cfg_info[0], siwithin_home)
     P = SimpleNamespace(checks=[], notes=[], dry=dry)
     chk = lambda level, text: P.checks.append((level, text))
-    if sys.platform == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
-    if sys.platform != "darwin": chk("refuse", f"{NAME} needs macOS sandbox-exec and refuses to run on {sys.platform} rather than run without a fence; see {ROADMAP}")
+    if PLATFORM == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
+    if PLATFORM == "linux":
+        if not os.path.exists(BWRAP): chk("refuse", f"{BWRAP} not found: install bubblewrap (apt install bubblewrap; dnf install bubblewrap)")
+        else:
+            chk("ok", "platform: Linux, bubblewrap")
+            problem = bwrap_preflight()
+            if problem: chk("refuse", problem)
+    elif PLATFORM != "darwin": chk("refuse", f"{NAME} needs macOS sandbox-exec or Linux bubblewrap and refuses to run on {PLATFORM} rather than run without a fence; see {ROADMAP}")
     else: chk("ok", "platform: macOS, sandbox-exec" + ("" if os.path.exists(SANDBOX_EXEC) else " MISSING"))
-    if sys.platform == "darwin" and not os.path.exists(SANDBOX_EXEC): chk("refuse", f"{SANDBOX_EXEC} not found")
+    if PLATFORM == "darwin" and not os.path.exists(SANDBOX_EXEC): chk("refuse", f"{SANDBOX_EXEC} not found")
     cfg_path, present, problems = cfg_info
     chk("ok" if present else "warn", f"config: {cfg_path} " + (f"read with {'tomllib' if tomllib else 'the built-in reader (Python < 3.11)'}" if present else "not found, built-in defaults in use"))
     for t in problems: chk("warn", t)
@@ -814,7 +915,10 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     net = o.network or cfg["fence"].get("network")
     if net not in NET_MODES: raise Refused(f"{'--network' if o.network else 'config.toml: [fence] network'} must be one of {', '.join(NET_MODES)}, not {net!r}")
     P.network = net
-    if net == "proxy":
+    if PLATFORM == "linux" and net == "report": chk("refuse", "network: report reads the macOS kernel's log, which Linux has no counterpart of; use proxy (the wall) or open")
+    elif PLATFORM == "linux" and net == "proxy" and P.proxy_on and not os.path.exists(SOCAT): chk("refuse", f"{SOCAT} not found: network = proxy bridges the run's loopback port to the key proxy with socat; install socat (apt install socat; dnf install socat), or use --network open")
+    elif PLATFORM == "linux" and net == "proxy" and P.proxy_on: chk("ok", "network: the run is in a namespace with no route out and may reach only the key proxy, by a Unix socket bound in and bridged by socat to the loopback port the CLI is given; a refused socket fails at connect and is not counted (no kernel report on Linux)")
+    elif net == "proxy":
         if P.proxy_on: chk("ok", "network: the run may open only the key proxy's loopback port; every other socket, DNS included, is refused by the fence, and the refusals are counted in summary.json (network) from the kernel's report")
         else: chk("refuse", f"network: proxy ([fence] network) allows the run only the key proxy's port, and adapter {name} has auth = \"env\", which starts no proxy; "
                             "set network = \"open\" under [fence] or pass --network open to leave the network as it was, or set auth = \"proxy\"")
@@ -903,12 +1007,14 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     bin_dirs = []
     if P.bin_path:
         rp = os.path.realpath(P.bin_path)
-        bin_dirs = [q for q in (os.path.dirname(os.path.abspath(P.bin_path)), os.path.dirname(rp), rp.split("/lib/node_modules/")[0] if "/lib/node_modules/" in rp else None) if q and under(q, home) and q != home]
-    P.profile = fence_profile(SimpleNamespace(home=home, folders=dirs, readonly=o.readonly, siwithin_home=siwithin_home, config_dir=P.config_dir, run=run, tmp=bool(ad["tmp_env"]),
-                                              last_message=P.last_message, fence=dict(cfg["fence"], network=P.network), read_extra=[os.path.join(home, r) for r in ad["read_home"]] + bin_dirs,
-                                              write_extra=[os.path.join(home, w) for w in ad["write_home"]]))
+        bin_dirs = [q for q in (os.path.dirname(os.path.abspath(P.bin_path)), os.path.dirname(rp), rp.split("/lib/node_modules/")[0] if "/lib/node_modules/" in rp else None)
+                    if q and ((under(q, home) and q != home) or (PLATFORM == "linux" and under(q, "/tmp") and q != "/tmp"))]  # on Linux /tmp is a private tmpfs of the run's, so a CLI kept under it is bound back in
+    P.fence_c = SimpleNamespace(home=home, folders=dirs, readonly=o.readonly, siwithin_home=siwithin_home, config_dir=P.config_dir, run=run, tmp=bool(ad["tmp_env"]),
+                                last_message=P.last_message, fence=dict(cfg["fence"], network=P.network), read_extra=[os.path.join(home, r) for r in ad["read_home"]] + bin_dirs,
+                                write_extra=[os.path.join(home, w) for w in ad["write_home"]], proxy_sock=PLATFORM == "linux" and P.network == "proxy")
+    P.fence_list = fence_args(P.fence_c) if PLATFORM == "linux" else None
+    P.profile = fence_text(P.fence_list) if PLATFORM == "linux" else fence_profile(P.fence_c)
     P.sb_path = os.path.join(run, "fence.sb")
-    P.argv = [SANDBOX_EXEC, "-f", P.sb_path] + P.cmd
     P.out_path = None
     if o.out:
         cand = os.path.realpath(os.path.join(dirs[0], os.path.expanduser(o.out)))
@@ -924,12 +1030,15 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
 def show_plan(P):
     pr = lambda *a: print(*a, flush=True)
     pr(f"{NAME} {VERSION} dry run: nothing is run, nothing is written")
-    pr("\n== command ==\n" + shlex.join([SANDBOX_EXEC, "-f", P.sb_path] + P.shown))
+    pr("\n== command ==\n" + shlex.join(fence_argv(P, P.shown, "<port>" if P.proxy_on else None)))
     pr(f"cwd: {P.dirs[0]}\nstdin: " + ("the brief" if P.ad["brief"] == "stdin" else "none") + f"\nrun folder: {P.run}")
     if P.proxy_on:
         pr(f"auth: proxy 127.0.0.1:<port>\nupstream: {P.upstream}, {P.upstream_timeout}s a request; the port is chosen when a real run starts, and nothing listens in this one")
         pr(f"paths: {', '.join(P.paths) or 'none'} ([auth] paths); any other path gets 403 and is not forwarded, and the real key is never attached to it")
     pr("\n== fence profile ==\n" + P.profile.replace(PROXY_PORT, "<port>"))
+    if PLATFORM == "linux":
+        pr(f"deny_write ({', '.join(P.fence_c.fence['deny_write']) or 'none'}) is redundant here: nothing outside the binds above is writable\n"
+           + ("network: proxy; " + LINUX_NET_NOTE + "\n" if P.network == "proxy" else ""))
     pr("== config checks ==")
     for lv, t in P.checks: pr(f"{lv:<6} {t}")
     pr("\n== budget ==")
@@ -1028,10 +1137,35 @@ class ProxyServer(http.server.ThreadingHTTPServer):
     def handle_error(self, request, client_address): pass  # a client that went away is not news; the handler logs what matters
 
 
+class ProxyUnixServer(socketserver.ThreadingUnixStreamServer):
+    """The proxy's second listener, on a Unix socket in the run's folder: on Linux the run's network namespace reaches the proxy by it (bound in, and bridged to a loopback port by socat)."""
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, path, handler):
+        # sockaddr_un holds about 104 bytes and a run folder's path can be longer: the socket is then bound by its bare name from inside the folder, and the working directory goes back at once
+        # (the runner has started no thread of its own by now)
+        here, bind = None, path
+        if len(os.fsencode(path)) > 100: here, bind = os.getcwd(), os.path.basename(path); os.chdir(os.path.dirname(path))
+        try:
+            super().__init__(bind, handler)
+            os.chmod(path, 0o600)
+        finally:
+            if here: os.chdir(here)
+
+    def handle_error(self, request, client_address): pass
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a): pass
+
+    def peer(self):
+        """The client's port for a TCP peer; None for a Unix socket's, which has no address (the log's client field is then null)."""
+        return self.client_address[1] if isinstance(self.client_address, tuple) and len(self.client_address) > 1 else None
+
+    def address_string(self): return str(self.client_address[0]) if isinstance(self.client_address, tuple) and self.client_address else "unix"
 
     def setup(self):
         super().setup(); self.server.proxy.client_up(self.request)
@@ -1057,7 +1191,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return None
 
     def serve(self):
-        px, client = self.server.proxy, self.client_address[1]
+        px, client = self.server.proxy, self.peer()
         path, query = urllib.parse.urlsplit(self.path).path, urllib.parse.urlsplit(self.path).query
         carried = self.carrier(px)
         if carried is None:
@@ -1139,7 +1273,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except (OSError, http.client.HTTPException): self.close_connection = True
         except Exception as x:
             self.close_connection = True
-            self.server.proxy.log(urllib.parse.urlsplit(self.path).path, None, 500, None, None, self.client_address[1], f"error {type(x).__name__}")
+            self.server.proxy.log(urllib.parse.urlsplit(self.path).path, None, 500, None, None, self.peer(), f"error {type(x).__name__}")
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_all
 
@@ -1148,7 +1282,7 @@ class KeyProxy:
     """One door to the API for one run. It holds the real key, answers only to the run's token, forwards each request, relays the response as it arrives, prices
     what passes at the [prices] rates, keeps a line per request in proxy.jsonl, and refuses further /v1/messages requests once its total reaches the budget."""
 
-    def __init__(self, key, key_header, upstream, timeout, prices, budget, log_path, paths=None):
+    def __init__(self, key, key_header, upstream, timeout, prices, budget, log_path, paths=None, sock_path=None):
         self._key = key  # the one place the key lives
         self.paths = {self.trim(p) for p in (DEFAULT_CONFIG["auth"]["paths"] if paths is None else paths)}
         self.token = f"{NAME}-{secrets.token_urlsafe(24)}"  # 32 characters after the prefix; new for every run
@@ -1164,6 +1298,11 @@ class KeyProxy:
         self.log_file = open(log_path, "w", encoding="utf-8")
         self.server = ProxyServer(("127.0.0.1", 0), ProxyHandler)
         self.server.proxy = self
+        self.sock_path, self.unix = sock_path, None  # Linux, network = "proxy": a second listener on a Unix socket, the one door the run's own network namespace can reach
+        if sock_path:
+            try: self.unix = ProxyUnixServer(sock_path, ProxyHandler)
+            except OSError: self.server.server_close(); raise
+            self.unix.proxy = self
         self.port = self.server.server_address[1]
         self.ctx = ssl.create_default_context() if self.https else None
 
@@ -1179,7 +1318,8 @@ class KeyProxy:
         return self.trim(path) in self.paths
 
     def start(self):
-        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start(); self.serving = True
+        for s in [self.server] + ([self.unix] if self.unix else []): threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+        self.serving = True
 
     def connect(self):
         return (http.client.HTTPSConnection(self.host, self.up_port, timeout=self.timeout, context=self.ctx) if self.https
@@ -1265,8 +1405,12 @@ class KeyProxy:
         """Stop serving, and cut every connection the run still holds: the token is worth nothing after this."""
         if self.closed: return
         self.sealed = self.closed = True
-        if self.serving: self.server.shutdown()
-        self.server.server_close()
+        for s in [self.server] + ([self.unix] if self.unix else []):
+            if self.serving: s.shutdown()
+            s.server_close()
+        if self.sock_path:
+            try: os.unlink(self.sock_path)
+            except OSError: pass
         with self.cv: socks = list(self.clients)
         for s in socks:
             try: s.shutdown(socket.SHUT_RDWR)
@@ -1310,7 +1454,7 @@ WALK_ROUNDS, WALK_GAP = 5, 0.2  # a kill is repeated up to this many times, this
 EXIT_WAIT = 3.0  # seconds the read loop waits for the CLI's pipe after the CLI has exited: an orphan can hold it open
 
 
-PS_ROW = re.compile(r"^\s*(\d+)\s+\S+\s+\d+:\d\d(?::\d\d)?(?:\.\d+)?(?:\s|$)")  # the start of a row of `ps -E -A`: pid, tty, cpu time
+PS_ROW = re.compile(r"^\s*(\d+)\s+\S+\s+\d+:\d\d(?::\d\d)?(?:\.\d+)?(?:\s|$)")  # the start of a row of `ps -E -A`, and on Linux of `ps -A -o pid=,tty=,time=,args= e`: pid, tty, cpu time
 
 
 def ps_table():
@@ -1326,10 +1470,10 @@ def ps_table():
 
 
 def ps_marked(markers):
-    """The pids of this user's processes whose environment holds every marker (NAME=value), from `ps -E -A -ww`, or None when ps cannot be read.
-    Each line is tested and dropped: an environment is never kept, logged or written, only the pid of a match."""
+    """The pids of this user's processes whose environment holds every marker (NAME=value), from `ps -E -A -ww` (on Linux `ps -A -ww -o pid=,tty=,time=,args= e`, the same shape of row, measured
+    on procps-ng 4.0.4 on 24 October 2026), or None when ps cannot be read. Each line is tested and dropped: an environment is never kept, logged or written, only the pid of a match."""
     pats = [re.compile(r"(?:^|\s)" + re.escape(m) + r"(?:\s|$)") for m in markers]
-    try: r = subprocess.run([PS, "-E", "-A", "-ww"], stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=20)
+    try: r = subprocess.run([PS, "-A", "-ww", "-o", "pid=,tty=,time=,args=", "e"] if PLATFORM == "linux" else [PS, "-E", "-A", "-ww"], stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError, ValueError): return None
     if r.returncode != 0: return None
     found, pid, rec = set(), None, []
@@ -1445,7 +1589,7 @@ def acquire_lock(path):
 
 
 def probe(P, args):
-    return subprocess.run([SANDBOX_EXEC, "-f", P.sb_path, P.bin_path] + args, capture_output=True, text=True, env=P.env, cwd=P.dirs[0], timeout=60)
+    return subprocess.run(fence_argv(P, [P.bin_path] + args, getattr(P, "port", None)), capture_output=True, text=True, env=P.env, cwd=P.dirs[0], timeout=60)
 
 
 def execute(P, cfg):
@@ -1456,9 +1600,11 @@ def execute(P, cfg):
     if not P.proxy_on: return run_cli(P, cfg, None)
     proxy, old_term = None, signal.signal(signal.SIGTERM, on_term)  # SIGTERM and ^C end in the finally below, which closes the door
     try:
-        proxy = KeyProxy(key, P.ad["key_header"], P.upstream, P.upstream_timeout, cfg["prices"], P.budget, os.path.join(P.run, PROXY_LOG), P.paths)
+        proxy = KeyProxy(key, P.ad["key_header"], P.upstream, P.upstream_timeout, cfg["prices"], P.budget, os.path.join(P.run, PROXY_LOG), P.paths,
+                         os.path.join(P.run, "proxy.sock") if PLATFORM == "linux" and P.network == "proxy" else None)
         key = None  # the proxy holds it now
         P.env[P.ad["key_env"]], P.env[P.ad["base_url_env"]] = proxy.token, f"http://127.0.0.1:{proxy.port}"
+        P.port = proxy.port  # the probes before the launch reach the proxy as the CLI does, through the same bridge on Linux
         proxy.start()
         return run_cli(P, cfg, proxy)
     finally:
@@ -1471,6 +1617,7 @@ def run_cli(P, cfg, proxy):
     with open(f"{run}/brief.md", "w", encoding="utf-8") as f: f.write(P.brief)
     profile = P.profile.replace(PROXY_PORT, str(proxy.port)) if proxy else P.profile
     if PROXY_PORT in profile: raise Refused("the fence profile names the key proxy's port and no proxy was started: an adapter with auth = \"env\" needs [fence] network = \"open\"")
+    if PLATFORM == "linux": fence_prepare(P.fence_c)  # the sources the bubblewrap binds name, made where the CLI's state paths and the last-message file were not there yet
     with open(P.sb_path, "w", encoding="utf-8") as f: f.write(profile)
     t_net = datetime.datetime.now()  # the kernel's report is read from here: the version and auth probes run under this profile, and its mark, before the CLI does
     notes = list(P.notes)
@@ -1495,7 +1642,7 @@ def run_cli(P, cfg, proxy):
     elif version not in P.measured: notes.append(f"CLI {version}, not one of {', '.join(P.measured) or 'none'} that the adapter was measured on: the command shape, the auth finding and any factor may differ")
 
     with open(f"{run}/command.txt", "w", encoding="utf-8") as f:
-        f.write(shlex.join([SANDBOX_EXEC, "-f", P.sb_path] + P.shown) + "\n" + "environment: " + ", ".join(sorted(P.env)) + f"\ncli: {version}\n"
+        f.write(shlex.join(fence_argv(P, P.shown, proxy.port if proxy else None)) + "\n" + "environment: " + ", ".join(sorted(P.env)) + f"\ncli: {version}\n"
                 + (f"auth: proxy 127.0.0.1:{proxy.port}\n" if proxy else "") + f"network: {P.network}\n")
     feed = PARSERS[ad["output"]]
     st = new_state(P.model)
@@ -1503,7 +1650,7 @@ def run_cli(P, cfg, proxy):
     t0 = datetime.datetime.now()
     old_term = signal.signal(signal.SIGTERM, on_term)  # a terminated tool still writes its summary and ledger line
     with open(f"{run}/events.jsonl", "w", encoding="utf-8") as ev, open(f"{run}/stderr.txt", "w", encoding="utf-8") as er:
-        proc = subprocess.Popen(P.argv, stdin=subprocess.PIPE if ad["brief"] == "stdin" else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=er, text=True,
+        proc = subprocess.Popen(fence_argv(P, P.cmd, proxy.port if proxy else None), stdin=subprocess.PIPE if ad["brief"] == "stdin" else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=er, text=True,
                                 encoding="utf-8", errors="replace", cwd=d, env=P.env, start_new_session=True)
 
         walk = Walk(proc, run_markers(P.env, ad), notes)  # the run's processes: what the CLI starts is killed with it, in its group or out of it
@@ -1581,7 +1728,9 @@ def run_cli(P, cfg, proxy):
     if proxy: proxy.drain(); proxy.freeze()  # requests in flight are booked or cut; the log is closed so the receipt can hash it
     mins = (datetime.datetime.now() - t0).total_seconds() / 60
     net = {"mode": P.network, "mark": None, "refused": 0, "reported": 0, "targets": {}, "processes": {}, "cli": 0, "others": 0, "unparsed": 0, "late": 0, "note": "unreported"}
-    if P.network != "open":  # the kernel's report, read twice once the run's processes are gone, LOG_WAIT apart: every line under this run's mark, and nothing else; the kernel lands its coalesced lines up to about two seconds late, so the second read's figures stand and what landed between is noted
+    if PLATFORM == "linux":
+        if P.network == "proxy": net["note"] = LINUX_NET_NOTE  # no kernel report to read: a socket the namespace refuses fails at connect and nothing counts it
+    elif P.network != "open":  # the kernel's report, read twice once the run's processes are gone, LOG_WAIT apart: every line under this run's mark, and nothing else; the kernel lands its coalesced lines up to about two seconds late, so the second read's figures stand and what landed between is noted
         try:
             figs = []
             for _ in (1, 2):
@@ -2168,7 +2317,7 @@ def parse_args(argv):
 def main(argv=None):
     try:
         o = parse_args(argv)
-        if sys.platform == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
+        if PLATFORM == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
         home = derive_home()
         siwithin_home = real(o.home) if o.home else os.path.join(home, ".config", NAME)
         if o.verify: return verify_ledger(siwithin_home, o.expect) if o.verify is True else verify_folder(o.verify)  # no lock, no config

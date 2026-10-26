@@ -19,6 +19,12 @@ config_write = ["projects", "sessions", "session-env", "shell-snapshots", "file-
 rc_files = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout", ".bash_profile", ".bash_login", ".bashrc", ".profile"]  # home-relative shell files a run may read; list files these source in read_home
 deny_write = ["/private/tmp", "/tmp", "/opt", "/usr/local", "/Applications", "/Library", "/Volumes"]  # roots outside the home where writes are refused
 deny_exec = ["/usr/bin/open", "/usr/sbin/screencapture", "/usr/bin/osascript", "/usr/bin/say", "/usr/bin/afplay", "/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch"]  # programs a run may not start, by path: a copy of one elsewhere is not stopped
+# On Linux (bubblewrap) four of the keys above have these built-in defaults instead, and the same keys in your config.toml replace them; the other [fence] keys are the same on both:
+# read_home = [".cache", ".gitconfig", ".config/git"]   # Linux: home-relative paths bound back read-only into the run's empty home, each only if it exists
+# write_home = [".cache"]   # Linux: home-relative paths bound back writable, each only if it exists
+# deny_write = ["/opt", "/usr/local", "/mnt", "/media", "/srv"]   # Linux: read for the dry run's text only; the whole tree is read-only there, so it changes nothing
+# deny_exec = ["/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch", "/usr/bin/systemd-run", "/usr/bin/xdg-open"]   # Linux: a program that exists is bound over with /dev/null so that starting it fails, by path
+# network = "proxy" or "open" on Linux; "report" is refused there, since it reads the macOS kernel's log; "proxy" needs socat for the bridge to the key proxy
 
 [env]
 pass = ["HOME", "PATH", "USER", "TMPDIR", "LANG", "SHELL", "TERM"]  # variables copied into the run's environment by name; nothing else is inherited

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Smoke test: python3 tests/smoke.py. A temporary home, no agent CLI installed, nothing outside the temporary folder is touched.
 
-Part 1 runs siwithin.py --dry-run as a subprocess for each built-in adapter and asserts the command, the fence profile's deny and allow lines,
+Part 1 (macOS) runs siwithin.py --dry-run as a subprocess for each built-in adapter and asserts the command, the fence profile's deny and allow lines,
 the refusal of forbidden folders, the cap arithmetic and the adapters' refusals. Part 2 checks the pieces: the TOML reader, the example config,
-the money, the profile builder. Part 3 (macOS) drives a whole run in-process against fake CLIs with the sandbox program replaced by a shim that
-only drops its profile argument: it tests what the tool does around the CLI (streaming, kills, ledger, summary), not the fence itself."""
+the money, the profile builder. The Linux group checks the Linux plan (bubblewrap's arguments, the preflight, the refusals, the walk's marker read) with
+siwithin.PLATFORM forced to "linux" and the bubblewrap program replaced by a shim, so it runs on either platform. Part 3 drives a whole run in-process
+against fake CLIs with the sandbox program replaced by a shim that only drops its arguments: once for macOS (on macOS) and once for Linux, with
+siwithin.PLATFORM forced; it tests what the tool does around the CLI (streaming, kills, ledger, summary), not the fence itself. Part 4 (Linux, with a
+working /usr/bin/bwrap only) runs fake CLIs inside the real fence; elsewhere it prints why it was skipped and counts nothing."""
 import copy, hashlib, importlib.util, io, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile, textwrap, time
 
 sys.dont_write_bytecode = True  # importing siwithin.py must not leave a __pycache__ in the project
@@ -25,13 +28,16 @@ def check(cond, what):
 def group(name): print(f"-- {name}")
 
 
-TMP = os.path.realpath(tempfile.mkdtemp(prefix="siwithin-smoke-"))
+TMP = TMP_ROOT = os.path.realpath(tempfile.mkdtemp(prefix="siwithin-smoke-"))  # TMP moves into a folder of its own for each pass of Part 3; TMP_ROOT is what is removed at the end
 HOME = os.path.join(TMP, "home"); os.makedirs(HOME)
 FH = os.path.join(HOME, ".config", siwithin.NAME); os.makedirs(FH)
 PROJ = os.path.join(HOME, "work", "proj"); os.makedirs(PROJ)
 READ = os.path.join(HOME, "work", "ref"); os.makedirs(READ)
 ENV = {"HOME": HOME, "PATH": "/usr/bin:/bin", "USER": "tester", "LANG": "C"}  # no CLI on this PATH
 DARWIN = sys.platform == "darwin"
+LINUX = sys.platform.startswith("linux")
+PLAT = "darwin"  # the pass of Part 3 in progress: "darwin" (the real platform, macOS only) or "linux" (siwithin.PLATFORM forced, the bubblewrap shim)
+NO_FILTER = r"\((allow|deny) (file-[a-z-]+\*?|process-exec)\)"  # a sandbox-exec rule with nothing listed would apply to everything; read in Part 1 (macOS only) and in Part 2, which runs on both platforms
 
 
 def write(path, text):
@@ -79,6 +85,37 @@ if os.environ.get("LOG_SHIM_LATE") and nth >= 2: line(f"1 duplicate report for S
 line("log run noninteractively, parent: 1 (zsh), args: '/usr/bin/log' 'show' '--predicate' 'eventMessage CONTAINS \"" + mark + "\"'", "/usr/bin/log")
 print(json.dumps({"processImagePath": "/kernel"}))
 print("")
+'''
+BWSHIM = r'''
+import json, os, sys
+# Stands in for /usr/bin/bwrap under siwithin.PLATFORM = "linux": it checks the arguments up to -- are bubblewrap's, as the tool builds them, and runs what follows --. There is no namespace here,
+# so the bridge cannot be exercised: the shim checks that the command is the shell line that starts socat on the run's loopback port and strips it, and the fake CLI reaches the proxy's TCP port as on macOS.
+a = sys.argv[1:]
+with open(@CALLS@, "a") as f: f.write(json.dumps(a) + "\n")
+assert "--" in a, a
+i = a.index("--"); opts, cmd = a[:i], a[i + 1:]
+j, unshare_net, sock, pre = 0, False, False, "--unshare-all" in opts
+while j < len(opts):
+    o = opts[j]
+    if o in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
+        src, dst = opts[j + 1], opts[j + 2]
+        assert src.startswith("/") and dst.startswith("/"), (o, src, dst)
+        if o in ("--bind", "--ro-bind"): assert os.path.exists(src), f"bubblewrap refuses a source that is not there: {o} {src}"
+        sock = sock or dst == @SOCK@
+        j += 3
+    elif o in ("--tmpfs", "--dev", "--proc"):
+        assert opts[j + 1].startswith("/"), (o, opts[j + 1]); j += 2
+    elif o.startswith("--unshare-") or o == "--die-with-parent":
+        unshare_net = unshare_net or o == "--unshare-net"; j += 1
+    else: sys.exit(f"bwrap shim: unknown option {o!r}")
+if not pre: assert unshare_net == sock, f"--unshare-net is for network = proxy and goes with the proxy's socket bind: net {unshare_net}, socket {sock}"
+if cmd[:2] == ["/bin/sh", "-c"] and @SOCAT@ in cmd[2]:
+    assert sock and unshare_net and cmd[2].startswith(@SOCAT@ + " TCP-LISTEN:") and ",bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:" + @SOCK@ + " & exec" in cmd[2], cmd
+    with open(@CALLS@, "a") as f: f.write(json.dumps({"bridge": cmd[2]}) + "\n")
+    cmd = cmd[3:]
+elif not pre: assert not (unshare_net and cmd[0] == "/bin/sh"), cmd
+if cmd == ["/bin/true"] and not os.path.exists("/bin/true"): sys.exit(0)  # the preflight, where /bin/true is not (macOS)
+os.execv(cmd[0], cmd)
 '''
 PCLAUDE = r'''
 import json, os, subprocess, sys, time, urllib.error, urllib.request
@@ -207,6 +244,10 @@ elif a == ["-E", "-A", "-ww"]:
     for pid in pids:
         b = info(pid)
         if b: print(f"{pid:5d} ??         0:00.00 " + " ".join(procargs(pid) or [b.comm.decode()]))
+elif a == ["-A", "-ww", "-o", "pid=,tty=,time=,args=", "e"]:  # the Linux walk's read: the same rows without the header, in procps's shape (measured: pid, tty, cpu time, command, then the environment)
+    for pid in pids:
+        b = info(pid)
+        if b: print(f"{pid:5d} ?        00:00:00 " + " ".join(procargs(pid) or [b.comm.decode()]))
 else: sys.exit(64)
 '''
 
@@ -260,6 +301,9 @@ elif "MODE:scrub" in brief: hold("scrubbed"); result()  # the same, its environm
 elif "MODE:orphan" in brief: orphan(); time.sleep(60)  # the program's launcher has exited; the CLI sleeps on and the timer stops it, as the live outlive brief ended
 else: result()
 '''
+
+
+PS_PATH = siwithin.PS  # the real ps, before any pass stands the stand-in in
 
 
 def ps_works(path):
@@ -348,32 +392,68 @@ def proxy_checks(whole, last_run, ledger, EH, ED, BIN, UP, pids):
     PF = mkhome("proxy")
 
     # ---- the network wall's figures: fence.sb names the proxy's real port, and the kernel's report (the log shim's canned lines here, under the run's mark) is counted in summary.json
-    NF = mkhome("net"); calls_path = os.path.join(os.path.dirname(BIN), "log-calls.txt")
-    rc, out, err, r, s, recs = fresh(NF, "a plain run under the network wall\n")
-    cmd_txt = open(os.path.join(r, "command.txt")).read(); port = int(re.search(r"^auth: proxy 127\.0\.0\.1:(\d+)$", cmd_txt, re.M).group(1)); sb = open(os.path.join(r, "fence.sb")).read()
-    mark = f"siwithin-net:{os.path.basename(r)}"; pid = int(open(os.path.join(r, "cli-pid.txt")).read()); nw = s["network"]
-    check(rc == 0 and f'(deny network* (with message "{mark}"))\n(allow network-outbound (remote ip "localhost:{port}"))' in sb and "@PROXY_PORT@" not in sb and "network: proxy\n" in cmd_txt,
-          f"network 12: the run's fence.sb refuses every socket under the run's own mark and allows the proxy's real port {port}; command.txt records the mode")
-    mine = [json.loads(l) for l in open(calls_path).read().splitlines() if mark in l]
-    check(len(mine) == 2 and all(m[:2] == ["show", "--start"] and m[2] <= m[4] and m[-2] == "--predicate" and m[-1] == f'eventMessage CONTAINS "{mark}"' for m in mine) and mine[0][4] <= mine[1][4],
-          f"network 12b: the kernel's report was read twice, by the run's mark, between the run's times, the second read's end no earlier than the first's: {mine}")
-    check(nw["mode"] == "proxy" and nw["mark"] == mark and (nw["refused"], nw["reported"], nw["cli"], nw["others"], nw["unparsed"], nw["late"]) == (4, 1, 4, 1, 0, 0) and nw["processes"] == {f"pclaude({pid})": 4, f"curl({pid + 1})": 1}
-          and nw["targets"]["deny network-outbound remote:*:443"] == 3 and not s["notes"], f"network 12c: summary.json's network figures: the refusals counted, the CLI's own pid {pid} told from the others': {nw}")
-    check("\nnetwork: proxy, refused 4 (cli 4, others 1): deny network-outbound remote:*:443 x3, allow network-outbound remote:*:9 x1, deny network-outbound /private/var/run/mDNSResponder x1\n" in out, f"network 12d: the line is printed after the summary line: {out[:400]!r}")
-    rc, out, err, r, s, recs = fresh(NF, "a plain run, the network reported\n", ["--network", "report"])
-    mark = f"siwithin-net:{os.path.basename(r)}"; sb = open(os.path.join(r, "fence.sb")).read(); nw = s["network"]
-    check(rc == 0 and f'(allow (with report) network* (with message "{mark}"))' in sb and "(deny network" not in sb and nw["mode"] == "report" and nw["reported"] == 1 and "network: report\n" in open(os.path.join(r, "command.txt")).read()
-          and "\nnetwork: report, reported 1 (cli 4, others 1): " in out, f"network 14: --network report on a proxy home: the report rule in fence.sb, the figures and the line say report: {nw}")
-    rc, out, err, r, s, recs = fresh(NF, "a plain run, the report unreadable\n", env=dict(KEY, LOG_SHIM_FAIL="1"))
-    nw = s["network"]
-    check(rc == 0 and s["status"] == "done" and nw["refused"] == 0 and nw["mark"] == f"siwithin-net:{os.path.basename(r)}" and "show exit 1: log: the report is not readable here" in nw["note"]
-          and sum(n.startswith("network: the kernel's report could not be read (") and n.endswith("the fence's refusals, if any, are uncounted") for n in s["notes"]) == 1
-          and "\nnetwork: proxy, refused 0 (cli 0, others 0); the kernel's report could not be read: " in out, f"network 15: when the report cannot be read the run still ends done, the figures are zero with the reason, and the note says the refusals are uncounted: {nw['note']!r}")
-    rc, out, err, r, s, recs = fresh(NF, "a plain run, a line landing late\n", env=dict(KEY, LOG_SHIM_LATE="1"))
-    nw = s["network"]; pid = int(open(os.path.join(r, "cli-pid.txt")).read())
-    check(rc == 0 and s["status"] == "done" and (nw["refused"], nw["late"]) == (5, 1) and nw["targets"]["deny network-outbound remote:*:443"] == 4 and nw["processes"][f"pclaude({pid})"] == 5
-          and s["notes"] == ["network: 1 of the kernel's lines landed between the first read of its report and the second, 0s apart; the second read's figures stand"]
-          and "\nnetwork: proxy, refused 5 (cli 5, others 1): deny network-outbound remote:*:443 x4, " in out, f"network 16: a coalesced line that lands between the two reads is counted by the second and noted: {nw} {s['notes']}")
+    NF = mkhome("net")
+    if PLAT == "darwin":
+        calls_path = os.path.join(os.path.dirname(BIN), "log-calls.txt")
+        rc, out, err, r, s, recs = fresh(NF, "a plain run under the network wall\n")
+        cmd_txt = open(os.path.join(r, "command.txt")).read(); port = int(re.search(r"^auth: proxy 127\.0\.0\.1:(\d+)$", cmd_txt, re.M).group(1)); sb = open(os.path.join(r, "fence.sb")).read()
+        mark = f"siwithin-net:{os.path.basename(r)}"; pid = int(open(os.path.join(r, "cli-pid.txt")).read()); nw = s["network"]
+        check(rc == 0 and f'(deny network* (with message "{mark}"))\n(allow network-outbound (remote ip "localhost:{port}"))' in sb and "@PROXY_PORT@" not in sb and "network: proxy\n" in cmd_txt,
+              f"network 12: the run's fence.sb refuses every socket under the run's own mark and allows the proxy's real port {port}; command.txt records the mode")
+        mine = [json.loads(l) for l in open(calls_path).read().splitlines() if mark in l]
+        check(len(mine) == 2 and all(m[:2] == ["show", "--start"] and m[2] <= m[4] and m[-2] == "--predicate" and m[-1] == f'eventMessage CONTAINS "{mark}"' for m in mine) and mine[0][4] <= mine[1][4],
+              f"network 12b: the kernel's report was read twice, by the run's mark, between the run's times, the second read's end no earlier than the first's: {mine}")
+        check(nw["mode"] == "proxy" and nw["mark"] == mark and (nw["refused"], nw["reported"], nw["cli"], nw["others"], nw["unparsed"], nw["late"]) == (4, 1, 4, 1, 0, 0) and nw["processes"] == {f"pclaude({pid})": 4, f"curl({pid + 1})": 1}
+              and nw["targets"]["deny network-outbound remote:*:443"] == 3 and not s["notes"], f"network 12c: summary.json's network figures: the refusals counted, the CLI's own pid {pid} told from the others': {nw}")
+        check("\nnetwork: proxy, refused 4 (cli 4, others 1): deny network-outbound remote:*:443 x3, allow network-outbound remote:*:9 x1, deny network-outbound /private/var/run/mDNSResponder x1\n" in out, f"network 12d: the line is printed after the summary line: {out[:400]!r}")
+        rc, out, err, r, s, recs = fresh(NF, "a plain run, the network reported\n", ["--network", "report"])
+        mark = f"siwithin-net:{os.path.basename(r)}"; sb = open(os.path.join(r, "fence.sb")).read(); nw = s["network"]
+        check(rc == 0 and f'(allow (with report) network* (with message "{mark}"))' in sb and "(deny network" not in sb and nw["mode"] == "report" and nw["reported"] == 1 and "network: report\n" in open(os.path.join(r, "command.txt")).read()
+              and "\nnetwork: report, reported 1 (cli 4, others 1): " in out, f"network 14: --network report on a proxy home: the report rule in fence.sb, the figures and the line say report: {nw}")
+        rc, out, err, r, s, recs = fresh(NF, "a plain run, the report unreadable\n", env=dict(KEY, LOG_SHIM_FAIL="1"))
+        nw = s["network"]
+        check(rc == 0 and s["status"] == "done" and nw["refused"] == 0 and nw["mark"] == f"siwithin-net:{os.path.basename(r)}" and "show exit 1: log: the report is not readable here" in nw["note"]
+              and sum(n.startswith("network: the kernel's report could not be read (") and n.endswith("the fence's refusals, if any, are uncounted") for n in s["notes"]) == 1
+              and "\nnetwork: proxy, refused 0 (cli 0, others 0); the kernel's report could not be read: " in out, f"network 15: when the report cannot be read the run still ends done, the figures are zero with the reason, and the note says the refusals are uncounted: {nw['note']!r}")
+        rc, out, err, r, s, recs = fresh(NF, "a plain run, a line landing late\n", env=dict(KEY, LOG_SHIM_LATE="1"))
+        nw = s["network"]; pid = int(open(os.path.join(r, "cli-pid.txt")).read())
+        check(rc == 0 and s["status"] == "done" and (nw["refused"], nw["late"]) == (5, 1) and nw["targets"]["deny network-outbound remote:*:443"] == 4 and nw["processes"][f"pclaude({pid})"] == 5
+              and s["notes"] == ["network: 1 of the kernel's lines landed between the first read of its report and the second, 0s apart; the second read's figures stand"]
+              and "\nnetwork: proxy, refused 5 (cli 5, others 1): deny network-outbound remote:*:443 x4, " in out, f"network 16: a coalesced line that lands between the two reads is counted by the second and noted: {nw} {s['notes']}")
+    else:  # Linux: bubblewrap's arguments in fence.sb, the bridge in the command, and no kernel report to read
+        rc, out, err, r, s, recs = fresh(NF, "a plain run under the network wall\n")
+        cmd_txt = open(os.path.join(r, "command.txt")).read(); port = int(re.search(r"^auth: proxy 127\.0\.0\.1:(\d+)$", cmd_txt, re.M).group(1)); sb = open(os.path.join(r, "fence.sb")).read().split("\n")
+        argv = shlex.split(cmd_txt.split("\n", 1)[0]); nw = s["network"]
+        check(rc == 0 and sb[0] == siwithin.FENCE_HEAD and "--unshare-net" in sb and ["--bind", os.path.join(r, "proxy.sock"), siwithin.PROXY_SOCK] == sb[sb.index("--bind", sb.index("--unshare-net")):][:3]
+              and "network: proxy\n" in cmd_txt and not os.path.exists(os.path.join(r, "proxy.sock")),
+              f"network 12: Linux: fence.sb is bubblewrap's arguments, one to a line under the first line, with --unshare-net and the proxy's Unix socket bound to its fixed path; the socket file is gone after the run")
+        i = argv.index("--")
+        check(argv[0] == os.path.join(BIN, "bwrap-shim") and argv[i + 1:i + 3] == ["/bin/sh", "-c"] and argv[i + 3] == f'{os.path.join(BIN, "socat-dummy")} TCP-LISTEN:{port},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:{siwithin.PROXY_SOCK} & exec "$0" "$@"'
+              and argv[i + 4].endswith("/pclaude") and argv[i + 5] == "-p" and argv[1:i] == sb[1:-1],
+              f"network 12b: Linux: command.txt is the fence program, its arguments, --, then the shell line that starts socat on the proxy's port {port} and execs the CLI: {argv[i + 1:i + 5]}")
+        calls = [json.loads(l) for l in open(os.path.join(os.path.dirname(BIN), "bwrap-calls.txt")).read().splitlines()]
+        bridges = [c["bridge"] for c in calls if isinstance(c, dict)]
+        check(bridges.count(argv[i + 3]) == 3 and all(f"TCP-LISTEN:{port}," in b for b in bridges if b == argv[i + 3]),
+              f"network 12c: Linux: the shim saw the same bridge line three times for the run, on the version probe, the auth probe and the launch: {bridges.count(argv[i + 3])}")
+        check(nw == {"mode": "proxy", "mark": None, "refused": 0, "reported": 0, "targets": {}, "processes": {}, "cli": 0, "others": 0, "unparsed": 0, "late": 0, "note": siwithin.LINUX_NET_NOTE} and not s["notes"]
+              and f"\nnetwork: proxy; {siwithin.LINUX_NET_NOTE}\n" in out and not os.path.exists(os.path.join(os.path.dirname(BIN), "log-calls.txt")),
+              f"network 12d: Linux: summary.json's network says proxy, nothing refused or reported, and why; the line is printed; the kernel's log was not read: {nw}")
+        n_runs = len(os.listdir(os.path.join(NF, "runs")))
+        rc, out, err, r, s, recs = fresh(NF, "a plain run, the network reported\n", ["--network", "report"])
+        check(rc == 1 and "network: report reads the macOS kernel's log, which Linux has no counterpart of; use proxy (the wall) or open" in err and len(os.listdir(os.path.join(NF, "runs"))) == n_runs,
+              f"network 14: Linux: --network report is refused before launch, naming the way out: {err.strip()[:130]}")
+        rc, out, err, r, s, recs = fresh(NF, "a plain run, the network open\n", ["--network", "open"])
+        sb = open(os.path.join(r, "fence.sb")).read().split("\n"); cmd_txt = open(os.path.join(r, "command.txt")).read(); argv = shlex.split(cmd_txt.split("\n", 1)[0])
+        check(rc == 0 and s["status"] == "done" and "--unshare-net" not in sb and not any(x.endswith("proxy.sock") for x in sb) and "network: open\n" in cmd_txt and argv[argv.index("--") + 1].endswith("/pclaude") and "TCP-LISTEN" not in cmd_txt
+              and s["network"]["mode"] == "open" and "\nnetwork: open, unreported\n" in out and len(recs) == 3 and not os.path.exists(os.path.join(r, "proxy.sock")),
+              "network 15: Linux: --network open: no --unshare-net, no socket bind, no bridge; the CLI reaches the proxy's TCP port and the requests arrive")
+        sd = os.path.join(BIN, "socat-dummy"); os.remove(sd); n_runs = len(os.listdir(os.path.join(NF, "runs")))
+        try:
+            rc, out, err, r, s, recs = fresh(NF, "a plain run, no socat\n")
+            rc_o, out_o, err_o, r_o, s_o, recs_o = fresh(NF, "a plain run, no socat, the network open\n", ["--network", "open"])
+        finally: write(sd, "#!/bin/sh\nexit 0\n"); os.chmod(sd, 0o755)
+        check(rc == 1 and "socat-dummy not found: network = proxy bridges the run's loopback port to the key proxy with socat; install socat (apt install socat; dnf install socat)" in err and len(os.listdir(os.path.join(NF, "runs"))) == n_runs + 1 and rc_o == 0 and s_o["status"] == "done",
+              f"network 16: Linux: network = proxy without socat is refused, naming the package and leaving no run; --network open does not need it: {err.strip()[:120]}")
     TAIL = re.compile(r" \| receipt ([0-9a-f]{64})$")
 
     # ---- the plain run: three requests that pass, one with a wrong token
@@ -918,154 +998,451 @@ def reconcile_tests():
     FAKE.shutdown(); FAKE.server_close()
 
 
+# ---- Linux: the plan and the fence's arguments with siwithin.PLATFORM forced, bubblewrap replaced by a shim -----------------------------------------------------
+
+BINDS = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try")
+
+
+def parse_bwrap(a):
+    """bubblewrap's argument list as (option, values) pairs: the bind options take a source and a destination, tmpfs, dev and proc a path, the rest nothing."""
+    out, i = [], 0
+    while i < len(a):
+        n = 2 if a[i] in BINDS else 1 if a[i] in ("--tmpfs", "--dev", "--proc") else 0
+        out.append((a[i], tuple(a[i + 1:i + 1 + n]))); i += 1 + n
+    return out
+
+
+def linux_tests():
+    L = os.path.join(TMP, "linux"); LH = os.path.join(L, "home"); LF = os.path.join(LH, ".config", siwithin.NAME); LP = os.path.join(LH, "work", "proj"); LR = os.path.join(LH, "work", "ref"); LB = os.path.join(L, "bin")
+    for p in (LF, LP, LR, LB): os.makedirs(p)
+    write(os.path.join(LF, "cap"), "100")
+    calls, socat = os.path.join(L, "bwrap-calls.txt"), os.path.join(LB, "socat")
+    write(socat, "#!/bin/sh\nexit 0\n"); os.chmod(socat, 0o755)
+    bw_ok, bw_fail = os.path.join(LB, "bwrap-ok"), os.path.join(LB, "bwrap-fail")
+    write(bw_ok, f"#!{sys.executable}\n" + BWSHIM.replace("@CALLS@", repr(calls)).replace("@SOCK@", repr(siwithin.PROXY_SOCK)).replace("@SOCAT@", repr(socat)))
+    write(bw_fail, f"#!{sys.executable}\nimport sys\nsys.stderr.write('bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\\n'); sys.exit(1)\n")
+    for p in (bw_ok, bw_fail): os.chmod(p, 0o755)
+    lenv = {"HOME": LH, "PATH": "/usr/bin:/bin", "USER": "tester", "LANG": "C"}
+
+    def as_platform(args, bw=bw_ok, sox=socat, plat="linux"):
+        saved = (siwithin.PLATFORM, siwithin.BWRAP, siwithin.SOCAT, dict(os.environ), sys.stdin, sys.stdout, sys.stderr)
+        siwithin.PLATFORM, siwithin.BWRAP, siwithin.SOCAT = plat, bw, sox
+        os.environ.clear(); os.environ.update(lenv); sys.stdin = io.StringIO("a brief\n")
+        o, e = io.StringIO(), io.StringIO(); sys.stdout, sys.stderr = o, e
+        try: rc = siwithin.main(["--home", LF] + args)
+        finally:
+            siwithin.PLATFORM, siwithin.BWRAP, siwithin.SOCAT = saved[:3]; os.environ.clear(); os.environ.update(saved[3]); sys.stdin, sys.stdout, sys.stderr = saved[4:]
+        return rc, o.getvalue(), e.getvalue()
+
+    def listing(): return sorted(os.listdir(LF))
+
+    group("linux: the plan, the preflight, the refusals")
+    before = listing()
+    rc, out, err = as_platform(["--dir", LP, "--read", LR, "--dry-run"])
+    t = tokens(out); i = t.index("--") if "--" in t else -1
+    check(rc == 0 and "ok     platform: Linux, bubblewrap" in out and listing() == before and not os.path.exists(os.path.join(LF, "runs")),
+          f"linux 1: a dry run on Linux passes its checks, says the platform, and writes nothing: rc {rc}, {err.strip()[:100]!r}")
+    check(t[0] == bw_ok and i > 0 and t[i + 1:i + 3] == ["/bin/sh", "-c"] and "TCP-LISTEN:<port>,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:" + siwithin.PROXY_SOCK + ' & exec "$0" "$@"' in t[i + 3] and t[i + 4:i + 6] == ["claude", "-p"],
+          f"linux 2: the command is the fence program, its arguments, --, then the socat line with <port> and the CLI: {t[:1]} {t[i:i + 6]}")
+    prof = section(out, "fence profile", "config checks"); lines = [x for x in prof.split("\n") if x]
+    check(lines[0] == siwithin.FENCE_HEAD and lines[1:12] == ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", LH] and "--unshare-net" in lines and "/tmp/siwithin-proxy.sock" in lines,
+          "linux 3: the dry run prints the arguments one to a line under their first line, the tree read-only, a private /tmp, the home empty, the network unshared")
+    check(not any(x.startswith("(") or x.startswith(";") for x in lines) and "Library" not in prof and "--ro-bind-try" in lines and os.path.join(LH, ".cache") in lines and os.path.join(LH, ".zshrc") in lines
+          and f"{LP}" in lines and f"{LR}" in lines and "deny_write (/opt, /usr/local, /mnt, /media, /srv) is redundant here: nothing outside the binds above is writable" in out,
+          "linux 4: no sandbox-exec rule in the output, the Linux read_home and rc files bound back, both folders bound, deny_write named as redundant")
+    check("ok     network: the run is in a namespace with no route out and may reach only the key proxy, by a Unix socket bound in and bridged by socat" in out and f"network: proxy; {siwithin.LINUX_NET_NOTE}" in out,
+          "linux 5: the plan's network lines say what the namespace is and that nothing is counted")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run", "--network", "open"]); lines = [x for x in section(out, "fence profile", "config checks").split("\n") if x]; t = tokens(out)
+    check(rc == 0 and "--unshare-net" not in lines and "/tmp/siwithin-proxy.sock" not in lines and "TCP-LISTEN" not in out.split("== fence profile ==")[0] and t[t.index("--") + 1:t.index("--") + 3] == ["claude", "-p"],
+          "linux 6: --network open leaves the network shared, binds no socket and starts no bridge")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run", "--network", "report"])
+    check(rc == 1 and "refuse network: report reads the macOS kernel's log, which Linux has no counterpart of; use proxy (the wall) or open" in out, f"linux 7: --network report is refused in the checks: rc {rc}")
+    rc, out, err = as_platform(["--dir", LP, "--network", "report"]); n_listed = listing()
+    check(rc == 1 and err.startswith("refused: ") and "no counterpart of" in err and listing() == before, f"linux 7b: and a real run is refused with it, writing nothing: {err.strip()[:80]!r}")
+    missing = os.path.join(L, "no-bwrap")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run"], bw=missing)
+    check(rc == 1 and f"refuse {missing} not found: install bubblewrap (apt install bubblewrap; dnf install bubblewrap)" in out, f"linux 8: bubblewrap missing is refused, the package named, in a dry run: rc {rc}")
+    rc, out, err = as_platform(["--dir", LP], bw=missing)
+    check(rc == 1 and "install bubblewrap (apt install bubblewrap; dnf install bubblewrap)" in err and listing() == before, "linux 8b: and in a real run, which leaves nothing behind")
+    no_socat = os.path.join(L, "no-socat")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run"], sox=no_socat)
+    check(rc == 1 and f"refuse {no_socat} not found: network = proxy bridges the run's loopback port to the key proxy with socat; install socat (apt install socat; dnf install socat), or use --network open" in out, "linux 9: network = proxy without socat is refused, the package named")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run", "--network", "open"], sox=no_socat)
+    check(rc == 0 and "socat" not in out, "linux 9b: with --network open socat is not required")
+    open(calls, "w").close()
+    rc, out, err = as_platform(["--dir", LP, "--dry-run"], bw=bw_fail); before_fail = listing()
+    check(rc == 1 and "refuse " + bw_fail + " said 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted'; bubblewrap cannot set up its namespaces here; on Ubuntu 23.10 and later unprivileged user namespaces are restricted by AppArmor, "
+          "and the remedy is root's: a profile for /usr/bin/bwrap that allows userns, or sysctl kernel.apparmor_restrict_unprivileged_userns=0 for this boot; see README.md, Linux" in out and listing() == before,
+          f"linux 10: a bubblewrap that cannot set up its namespaces refuses the dry run with its own last line quoted and the two remedies named, writing nothing: rc {rc}")
+    rc, out, err = as_platform(["--dir", LP], bw=bw_fail)
+    check(rc == 1 and "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" in err and "kernel.apparmor_restrict_unprivileged_userns" in err and listing() == before and "ok     platform" not in err,
+          f"linux 10b: and a real run is refused the same way before anything is made: {err.strip()[:90]!r}")
+    open(calls, "w").close(); as_platform(["--dir", LP, "--dry-run"])
+    first = json.loads(open(calls).read().splitlines()[0])
+    check(first == ["--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--", "/bin/true"],
+          f"linux 11: the preflight is one run of bubblewrap on /bin/true with the tree, /dev, /proc and /tmp: {first}")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run"], plat="freebsd14")
+    check(rc == 1 and "refuse " + siwithin.NAME + " needs macOS sandbox-exec or Linux bubblewrap and refuses to run on freebsd14 rather than run without a fence; see README.md, 'What it does not do'" in out, "linux 12: any other platform refuses, the message widened, the roadmap pointing at a heading that exists")
+    rc, out, err = as_platform(["--dir", LP, "--dry-run"], plat="win32")
+    check(rc == 1 and "refuses to run on Windows rather than run without a fence; see README.md, 'What it does not do'" in err and "## What it does not do\n" in open(os.path.join(ROOT, "README.md"), encoding="utf-8").read(),
+          "linux 13: Windows refuses as before, and README.md has the heading the message names")
+    saved_plat = siwithin.PLATFORM
+    try:
+        siwithin.PLATFORM = "linux"; cl = siwithin.load_config(LF)[0]["fence"]
+        write(os.path.join(LF, "config.toml"), "[fence]\nwrite_home = []\n"); cu = siwithin.load_config(LF)[0]["fence"]; os.remove(os.path.join(LF, "config.toml"))
+        siwithin.PLATFORM = "darwin"; cd = siwithin.load_config(LF)[0]["fence"]
+    finally: siwithin.PLATFORM = saved_plat
+    check(cl["read_home"] == [".cache", ".gitconfig", ".config/git"] and cl["write_home"] == [".cache"] and cl["deny_exec"] == ["/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch", "/usr/bin/systemd-run", "/usr/bin/xdg-open"]
+          and cl["rc_files"] == siwithin.DEFAULT_CONFIG["fence"]["rc_files"] and cl["config_write"] == siwithin.DEFAULT_CONFIG["fence"]["config_write"] and cu["write_home"] == [] and cu["read_home"] == cl["read_home"]
+          and cd == siwithin.DEFAULT_CONFIG["fence"] and "Library/Caches" in cd["read_home"],
+          "linux 14: the [fence] defaults are keyed by platform: Linux's lists, config.toml still wins, macOS's unchanged")
+
+    group("linux: fence_args by itself")
+    S = os.path.join(L, "siw"); CD = os.path.join(S, "claude-config"); RUN = os.path.join(S, "runs", "r1"); EXE = os.path.join(L, "present-prog")
+    os.makedirs(os.path.join(CD, "projects", "-a", "memory")); os.makedirs(os.path.join(CD, "projects", "-b")); os.makedirs(RUN); write(EXE, "x")
+    fence = dict(siwithin.DEFAULT_CONFIG["fence"], **siwithin.LINUX_FENCE); fence.update(network="proxy", deny_exec=[EXE, os.path.join(L, "absent-prog")])
+    mk = lambda **kw: siwithin.SimpleNamespace(**dict(dict(home="/h", folders=["/h/work/proj-x", "/h/work/ref"], readonly=False, siwithin_home=S, config_dir=CD, run=RUN, tmp=True, last_message=True, fence=fence,
+                                                         read_extra=["/h/.local/bin", "/h/.local/share/claude"], write_extra=["/h/.local/state"], proxy_sock=True), **kw))
+    c = mk(); a = siwithin.fence_args(c); pairs = parse_bwrap(a)
+    at = lambda opt, *v: pairs.index((opt, tuple(v))) if (opt, tuple(v)) in pairs else None
+    order = [at("--ro-bind", "/", "/"), at("--tmpfs", "/tmp"), at("--tmpfs", "/h"), at("--ro-bind-try", "/h/.cache", "/h/.cache"), at("--ro-bind-try", "/h/.zshrc", "/h/.zshrc"), at("--ro-bind-try", "/h/.local/bin", "/h/.local/bin"),
+             at("--bind-try", "/h/.cache", "/h/.cache"), at("--bind-try", "/h/.local/state", "/h/.local/state"), at("--bind", "/h/work/proj-x", "/h/work/proj-x"), at("--ro-bind", "/h/work/ref", "/h/work/ref"), at("--tmpfs", S),
+             at("--bind", RUN + "/tmp", RUN + "/tmp"), at("--bind", RUN + "/last-message.txt", RUN + "/last-message.txt"), at("--ro-bind", CD, CD), at("--bind", CD + "/projects", CD + "/projects"),
+             at("--ro-bind", CD + "/projects/-a/memory", CD + "/projects/-a/memory"), at("--ro-bind", CD + "/projects/-h-work-proj-x/memory", CD + "/projects/-h-work-proj-x/memory"), at("--ro-bind", "/dev/null", EXE),
+             at("--unshare-user"), at("--unshare-net"), at("--bind", RUN + "/proxy.sock", siwithin.PROXY_SOCK)]
+    check(None not in order and order == sorted(order) and len(set(order)) == len(order) and a[:11] == ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/h"],
+          f"fence_args 1: the rules come in the order bubblewrap applies them (tree, /tmp, empty home, home binds, folders, the tool's home, the run's own binds, the config directory, memory, deny_exec, namespaces, the socket): {order}")
+    check(at("--tmpfs", "/h") < min(i for i, (o, v) in enumerate(pairs) if o in BINDS and v[0].startswith("/h/")) and at("--tmpfs", S) > max(i for i, (o, v) in enumerate(pairs) if o in BINDS and v[0].startswith("/h/")),
+          "fence_args 2: the home's tmpfs comes before every bind into the home, the tool's home's tmpfs after all of them")
+    under_s = {v[0] for o, v in pairs if o in BINDS and v[0].startswith(S + "/") and not siwithin.under(v[0], CD)}
+    check(under_s == {RUN + "/tmp", RUN + "/last-message.txt", RUN + "/proxy.sock"} and not any(v[0] in (S, S + "/cap", S + "/ledger.md", S + "/runs", RUN) for o, v in pairs if o in BINDS),
+          f"fence_args 3: nothing under the tool's home but the run's tmp, last-message.txt and proxy.sock is bound, besides the config directory: {sorted(under_s)}")
+    cw = [at("--bind", CD + "/" + p, CD + "/" + p) for p in fence["config_write"]]
+    mem = [at("--ro-bind", m, m) for m in (CD + "/projects/-a/memory", CD + "/projects/-h-work-proj-x/memory")]
+    check(None not in cw and len(cw) == 16 and all(x > at("--ro-bind", CD, CD) for x in cw) and all(m > at("--bind", CD + "/projects", CD + "/projects") for m in mem) and at("--ro-bind", CD + "/projects/-b/memory", CD + "/projects/-b/memory") is None,
+          "fence_args 4: each config_write path is bound after the read-only config directory, and each memory folder is bound read-only again after them (an existing one, and the run's own project's); a project with none is not given one")
+    check(at("--ro-bind", "/dev/null", EXE) is not None and not any(v == ("/dev/null", os.path.join(L, "absent-prog")) for o, v in pairs) and sum(1 for o, v in pairs if v[:1] == ("/dev/null",)) == 1,
+          "fence_args 5: a deny_exec path that exists is bound over with /dev/null, one that does not is left out")
+    c_open = mk(fence=dict(fence, network="open"), proxy_sock=False, readonly=True); a_open = siwithin.fence_args(c_open)
+    check("--unshare-net" in a and "--unshare-net" not in a_open and not any(x.endswith("proxy.sock") for x in a_open) and ("--ro-bind", ("/h/work/proj-x", "/h/work/proj-x")) in parse_bwrap(a_open)
+          and ("--bind", ("/h/work/proj-x", "/h/work/proj-x")) not in parse_bwrap(a_open) and "--new-session" not in a and "--cap-add" not in " ".join(a) and "--die-with-parent" in a,
+          "fence_args 6: --unshare-net only for proxy, no socket bind for open, a readonly run's first folder bound read-only, no --new-session and no capability added")
+    a_odd = siwithin.fence_args(mk(folders=["/h/work/my_proj"]))
+    check(not any(v and "my_proj" in v[0] and v[0].endswith("memory") for o, v in parse_bwrap(a_odd)) and sum(1 for o, v in parse_bwrap(a_odd) if v[:1] and v[0].endswith("/memory")) == 1 and siwithin.project_dir_name("/h/work/my_proj") is None
+          and siwithin.project_dir_name("/h/work/proj-x") == "-h-work-proj-x",
+          "fence_args 7: a folder with a character outside letters, digits, / and - is given no memory bind of its own: the CLI's name for it was not seen")
+    try: siwithin.fence_args(mk(folders=["/h/work/bad\nname"])); bad = None
+    except siwithin.Refused as x: bad = str(x)
+    check(bad is not None and "control character" in bad, f"fence_args 8: a path with a control character is refused: {bad!r}")
+    seen_before = sorted(os.listdir(CD)) + sorted(os.listdir(os.path.join(CD, "projects")))
+    siwithin.fence_args(c)
+    check(sorted(os.listdir(CD)) + sorted(os.listdir(os.path.join(CD, "projects"))) == seen_before and not os.path.exists(RUN + "/last-message.txt"), "fence_args 9: building the arguments creates nothing")
+    siwithin.fence_prepare(c)
+    check(all(os.path.isdir(CD + "/" + p) for p in fence["config_write"] if "." not in p) and all(os.path.isfile(CD + "/" + p) for p in ("history.jsonl", ".last-cleanup")) and os.path.isdir(CD + "/projects/-h-work-proj-x/memory")
+          and os.path.getsize(RUN + "/last-message.txt") == 0 and os.path.isdir(CD + "/projects/-a/memory"), "fence_args 10: fence_prepare makes the state folders, the two state files empty, the run's memory folder and the last-message file")
+
+    group("linux: the walk's marker read")
+    ps_calls = os.path.join(L, "ps-calls.txt"); ps = os.path.join(LB, "ps")
+    write(ps, f"#!{sys.executable}\nimport json, sys\nopen({ps_calls!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+              "if sys.argv[1:] != ['-A', '-ww', '-o', 'pid=,tty=,time=,args=', 'e']: sys.exit(64)\n"
+              "print('''    1 ?        00:00:03 /sbin/init splash HOME=/root LANG=C\n"
+              "  101 pts/0    00:00:00 /usr/bin/python3 x.py HOME=/h CLAUDE_CODE_TMPDIR=/r/tmp CLAUDE_CONFIG_DIR=/c TERM=x\n"
+              "  102 ?        00:00:00 sleep 5 CLAUDE_CODE_TMPDIR=/r/tmp PATH=/usr/bin\n"
+              " 4321 ?        01:02:03 bwrap --unshare-user --die-with-parent -- claude -p FOO=bar CLAUDE_CONFIG_DIR=/c CLAUDE_CODE_TMPDIR=/r/tmp\n"
+              "  103 ?        00:00:00 sleep 6 CLAUDE_CODE_TMPDIR=/r/tmp CLAUDE_CONFIG_DIR=/cc\n"
+              "  104 ?        00:00:00 sh -c 'echo CLAUDE_CODE_TMPDIR=/r/tmp'\n"
+              "  105 ?        00:00:00 sleep 7 CLAUDE_CONFIG_DIR=/c LANG=C''')\n")
+    os.chmod(ps, 0o755)
+    saved_ps, saved_plat = siwithin.PS, siwithin.PLATFORM
+    try:
+        siwithin.PS, siwithin.PLATFORM = ps, "linux"
+        found = siwithin.ps_marked(["CLAUDE_CODE_TMPDIR=/r/tmp", "CLAUDE_CONFIG_DIR=/c"]); one = siwithin.ps_marked(["CLAUDE_CODE_TMPDIR=/r/tmp"])
+    finally: siwithin.PS, siwithin.PLATFORM = saved_ps, saved_plat
+    got = [json.loads(l) for l in open(ps_calls).read().splitlines()]
+    check(found == {101, 4321} and one == {101, 102, 103, 4321} and got == [["-A", "-ww", "-o", "pid=,tty=,time=,args=", "e"]] * 2,
+          f"walk linux 1: with the Linux arguments ps_marked finds the pid carrying every marker and not the one carrying only one, a longer value, or the text in a command: {sorted(found)} {sorted(one)}; ps was called with {got[0]}")
+
+
+# ---- Part 4, Linux only: fake CLIs inside the real bubblewrap ------------------------------------------------------------------------------------------------------
+
+BCLAUDE = r'''
+import json, os, socket, subprocess, sys, time, urllib.request
+a = sys.argv[1:]
+if a == ["--version"]: print("2.1.296 (fake)"); sys.exit(0)
+if a == ["auth", "status"]: print(json.dumps({"loggedIn": True, "authMethod": "api_key"})); sys.exit(0)
+brief = sys.stdin.read()
+d = os.getcwd()  # the run's first folder: the one place besides its temp root that the fence lets this program write
+def ev(o): print(json.dumps(o), flush=True)
+def put(name, text):
+    with open(os.path.join(d, name), "w") as f: f.write(text)
+def attempt(fn):
+    try: fn(); return ["ok", 0]
+    except OSError as e: return [type(e).__name__, e.errno]
+ev({"type": "system", "subtype": "init", "apiKeySource": "ANTHROPIC_API_KEY", "session_id": "sess-4"})
+HB = """
+import os, sys, time
+with open(os.path.join(sys.argv[1], "hb.txt"), "a") as f:
+    end = time.time() + 40
+    while time.time() < end: print(repr(time.time()), file=f, flush=True); time.sleep(0.05)
+"""
+if "MODE:probe" in brief:
+    p = json.loads(brief.split("MODE:probe ", 1)[1])
+    put("probe.json", json.dumps({"marker": attempt(lambda: open(p["marker"]).read()), "w1": attempt(lambda: open(os.path.join(d, "w1.txt"), "w").write("x")),
+                                  "w2": attempt(lambda: open(os.path.join(p["ro"], "w2.txt"), "w").write("x")), "tmp": attempt(lambda: open(p["tmpfile"], "w").write("x")),
+                                  "cap": attempt(lambda: open(p["cap"]).read()), "etc": attempt(lambda: open("/etc/siwithin-probe", "w").write("x")),
+                                  "pid": os.path.exists("/proc/%d" % p["pid"]), "proc": sorted(x for x in (os.listdir("/proc") if os.path.isdir("/proc") else []) if x.isdigit())[:5]}))
+elif "MODE:wall" in brief:
+    try: socket.create_connection(("1.1.1.1", 53), 2).close(); put("wall.txt", "connected")
+    except OSError as e: put("wall.txt", f"{type(e).__name__} errno {e.errno} {e}")
+elif "MODE:detach" in brief:
+    subprocess.Popen([sys.executable, "-c", HB, d], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(200):
+        if os.path.exists(os.path.join(d, "hb.txt")) and len(open(os.path.join(d, "hb.txt")).read().split("\n")) > 3: break
+        time.sleep(0.02)
+else:  # a request to the API as the CLI makes it: the address it was given, the token it was given
+    req = urllib.request.Request(os.environ["ANTHROPIC_BASE_URL"] + "/v1/messages", method="POST", headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"], "content-type": "application/json"},
+                                 data=json.dumps({"model": "claude-sonnet-5-5", "max_tokens": 16, "stream": False, "messages": []}).encode())
+    put("post.txt", f"{urllib.request.urlopen(req, timeout=20).status} {os.environ['ANTHROPIC_BASE_URL']}")
+ev({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "result": "part 4 done", "total_cost_usd": 0.0004, "session_id": "sess-4", "permission_denials": [],
+    "modelUsage": {"claude-sonnet-5-5": {"inputTokens": 200, "outputTokens": 40, "cacheReadInputTokens": 100, "cacheCreationInputTokens": 0, "webSearchRequests": 0, "costUSD": 0.0004}}})
+'''
+
+
+def linux_real_tests():
+    if not LINUX: print(f"Part 4 skipped: this is {sys.platform}, not Linux; the fence it tests is bubblewrap"); return
+    if not os.path.exists(siwithin.BWRAP): print(f"Part 4 skipped: {siwithin.BWRAP} not found (apt install bubblewrap)"); return
+    why = siwithin.bwrap_preflight()
+    if why: print(f"Part 4 skipped: {why}"); return
+    import http.server, signal, threading
+    group("Part 4: the real bubblewrap, fake CLIs and a fake upstream")
+    show[0] = True  # each check is named as it passes: this part's first run on a machine is read line by line
+    have_socat = os.path.exists(siwithin.SOCAT)
+    B4 = os.path.join(TMP_ROOT, "part4"); H4 = os.path.join(B4, "home"); F4 = os.path.join(H4, ".config", siwithin.NAME); BIN4 = os.path.join(H4, "bin"); D1 = os.path.join(H4, "work", "proj"); D2 = os.path.join(H4, "work", "ref")
+    for p in (F4, BIN4, D1, D2): os.makedirs(p)
+    write(os.path.join(F4, "cap"), "100"); write(os.path.join(H4, "marker.txt"), "outside the fence"); write(os.path.join(BIN4, "bclaude"), f"#!{sys.executable}\n" + BCLAUDE); os.chmod(os.path.join(BIN4, "bclaude"), 0o755)
+
+    class Up(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a): pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0)); self.server.recs.append({"path": self.path, "key": self.headers.get("x-api-key")})
+            out = json.dumps({"id": "msg_j", "type": "message", "model": "claude-sonnet-5-5", "usage": {"input_tokens": 100, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 50, "output_tokens": 20}}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+
+    UP = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Up); UP.daemon_threads = True; UP.recs = []
+    threading.Thread(target=UP.serve_forever, daemon=True).start()
+    write(os.path.join(F4, "config.toml"), f'[adapters.claude]\nbin = "bclaude"\n[auth]\nupstream = "http://127.0.0.1:{UP.server_address[1]}"\n')
+    env = {"HOME": H4, "PATH": BIN4 + ":/usr/bin:/bin", "USER": "tester", "LANG": "C", "ANTHROPIC_API_KEY": TESTKEY}
+
+    def run(brief, *args):
+        saved = (dict(os.environ), sys.stdin, sys.stdout, sys.stderr)
+        os.environ.clear(); os.environ.update(env); sys.stdin = io.StringIO(brief); o, e = io.StringIO(), io.StringIO(); sys.stdout, sys.stderr = o, e
+        try: rc = siwithin.main(["--home", F4, "--dir", D1, "--read", D2, "--timeout", "60"] + list(args))
+        finally: os.environ.clear(); os.environ.update(saved[0]); sys.stdin, sys.stdout, sys.stderr = saved[1:]
+        runs = sorted(os.listdir(os.path.join(F4, "runs")), key=lambda n: os.stat(os.path.join(F4, "runs", n)).st_mtime_ns)
+        r = os.path.join(F4, "runs", runs[-1]) if runs else None
+        return rc, o.getvalue(), e.getvalue(), r, (json.load(open(os.path.join(r, "summary.json"))) if r and os.path.exists(os.path.join(r, "summary.json")) else {})
+
+    net = [] if have_socat else ["--network", "open"]  # the bridge needs socat: without it the probes run with the network open and the wall and the bridge are not checked
+    if not have_socat: print(f"Part 4: {siwithin.SOCAT} not found (apt install socat): (b) the wall and (c) the bridge are skipped, the other runs use --network open")
+    tmpfile = f"/tmp/siwithin-probe-{os.getpid()}"
+    # (a) a probe as the CLI
+    probe = {"marker": os.path.join(H4, "marker.txt"), "ro": D2, "tmpfile": tmpfile, "cap": os.path.join(F4, "cap"), "pid": os.getpid()}
+    rc, out, err, r, s = run("MODE:probe " + json.dumps(probe), *net)
+    pj = json.load(open(os.path.join(D1, "probe.json"))) if os.path.exists(os.path.join(D1, "probe.json")) else {}
+    check(rc == 0 and s.get("status") == "done" and pj, f"part 4 a0: the probe run is done and wrote its answers into the first folder: rc {rc}, {s.get('status')}, {err.strip()[:200]!r}, stderr.txt: {open(os.path.join(r, 'stderr.txt')).read()[-500:]!r}")
+    check(pj.get("marker") == ["FileNotFoundError", 2], f"part 4 a1: a file planted in the home is not found inside: {pj.get('marker')}")
+    check(pj.get("w1") == ["ok", 0] and os.path.exists(os.path.join(D1, "w1.txt")), f"part 4 a2: a write in the first folder is kept: {pj.get('w1')}")
+    check(pj.get("w2", [0, 0])[1] == 30 and not os.path.exists(os.path.join(D2, "w2.txt")), f"part 4 a3: a write in the second folder, read-only, is refused (Read-only file system): {pj.get('w2')}")
+    check(pj.get("tmp") == ["ok", 0] and not os.path.exists(tmpfile), f"part 4 a4: a write to /tmp is allowed inside and gone after the run: {pj.get('tmp')}, outside: {os.path.exists(tmpfile)}")
+    check(pj.get("cap") == ["FileNotFoundError", 2], f"part 4 a5: the tool's own home is not there: its cap file is not found: {pj.get('cap')}")
+    check(pj.get("pid") is False and pj.get("etc", [0, 0])[1] == 30, f"part 4 a6: the runner's pid is not in /proc inside ({pj.get('proc')}), and a write under /etc is refused: {pj.get('etc')}")
+    check(os.path.isfile(os.path.join(r, "fence.sb")) and open(os.path.join(r, "fence.sb")).read().startswith(siwithin.FENCE_HEAD + "\n") and "outlived" in s, "part 4 a7: the run folder holds fence.sb, bubblewrap's arguments, and the summary says outlived")
+    if have_socat:
+        # (b) the wall
+        rc, out, err, r, s = run("MODE:wall")
+        wall = open(os.path.join(D1, "wall.txt")).read() if os.path.exists(os.path.join(D1, "wall.txt")) else ""
+        check(rc == 0 and "errno 101" in wall and "Network is unreachable" in wall, f"part 4 b: the wall: a connect to 1.1.1.1:53 fails at once with errno 101: {wall!r}")
+        # (c) the bridge
+        UP.recs.clear(); n_lines = len(open(os.path.join(F4, "ledger.md")).read().strip().split("\n"))
+        rc, out, err, r, s = run("MODE:basic")
+        post = open(os.path.join(D1, "post.txt")).read() if os.path.exists(os.path.join(D1, "post.txt")) else ""
+        check(rc == 0 and s.get("status") == "done" and post.startswith("200 http://127.0.0.1:") and [x["key"] for x in UP.recs] == [TESTKEY] and [x["path"] for x in UP.recs] == ["/v1/messages"],
+              f"part 4 c1: the CLI's request to its loopback address reached the upstream outside with the real key, through socat and the Unix socket: {post!r}, upstream saw {UP.recs}, {err.strip()[:150]!r}")
+        led = open(os.path.join(F4, "ledger.md")).read().strip().split("\n")
+        rc2, out2, _ = tool_cli(["--verify", "--home", F4])
+        check(len(led) == n_lines + 1 and "true $0.0004" in led[-1] and s.get("proxy_requests") == 1 and rc2 == 0 and TESTKEY not in open(os.path.join(r, "proxy.jsonl")).read()
+              and s["network"]["note"] == siwithin.LINUX_NET_NOTE and not os.path.exists(os.path.join(r, "proxy.sock")), f"part 4 c2: the ledger line and the receipt are as on macOS, --verify passes, the socket file is gone: {led[-1][-120:]!r}")
+    # (d) a detached program
+    for f in ("hb.txt",):
+        if os.path.exists(os.path.join(D1, f)): os.remove(os.path.join(D1, f))
+    rc, out, err, r, s = run("MODE:detach", *net)
+    hb = os.path.join(D1, "hb.txt"); end = time.time() + 3.5; still = True
+    while time.time() < end and still:
+        size = os.path.getsize(hb); time.sleep(0.5); still = os.path.getsize(hb) != size  # growing: still running
+    check(rc == 0 and not still and "outlived" in s, f"part 4 d: a detached heartbeat started inside is gone within three seconds of the runner's return; outlived on record: {s.get('outlived')}")
+    # (e) the network open
+    UP.recs.clear()
+    rc, out, err, r, s = run("MODE:basic", "--network", "open")
+    post = open(os.path.join(D1, "post.txt")).read()
+    check(rc == 0 and s.get("status") == "done" and [x["key"] for x in UP.recs] == [TESTKEY] and "--unshare-net" not in open(os.path.join(r, "fence.sb")).read().split("\n") and s["network"]["mode"] == "open",
+          f"part 4 e: --network open: the same request reaches the upstream, and the arguments hold no --unshare-net: {post!r}")
+    show[0] = False
+    UP.shutdown(); UP.server_close()
+
+
 try:
     # ---------------------------------------------------------------- part 1: dry runs
     write(os.path.join(FH, "cap"), "10\n")
     write(os.path.join(FH, "ledger.md"), f"# {siwithin.NAME} ledger\n"
           "2026-10-01 09:00 | a | /x | claude sonnet - | 3 turns | 1.0 min | cli $4.2500 | true $4.2500 | in 1k out 1k | runs/a | done\n"
           "2026-10-02 09:00 | b | /x | claude sonnet - | 3 turns | 1.0 min | cli $2.2500 | true $2.2500 | in 1k out 1k | runs/b | done\n")
-    good_rc = 0 if DARWIN else 1  # elsewhere the dry run prints everything and still reports the refusal
+    LINUX_OK = LINUX and os.path.exists(siwithin.BWRAP) and os.path.exists(siwithin.SOCAT) and siwithin.bwrap_preflight() is None  # a real dry run on Linux passes its checks only with bubblewrap working and socat there
+    good_rc = 0 if DARWIN or LINUX_OK else 1  # elsewhere the dry run prints everything and still reports the refusal
 
-    group("claude dry run")
-    rc, out, err = tool_cli(["--dir", PROJ, "--read", READ, "--dry-run"])  # the default budget of 5 is over what the ledger and cap leave: exit 1, everything still printed
-    check(rc == 1, f"claude dry run exit {rc}, stderr {err!r}")
-    t = tokens(out)
-    check(t[0] == siwithin.SANDBOX_EXEC and t[1] == "-f" and t[2].endswith("/fence.sb") and t[3] == "claude" and t[4] == "-p", f"command starts with the fence and the CLI: {t[:5]}")
-    check(after(t, "--max-turns") == "40" and after(t, "--max-budget-usd") == "5", "turn limit 40 and budget flag 5 (factor 1)")
-    check(t.count("--add-dir") == 2 and PROJ in t and READ in t, "both folders announced with --add-dir")
-    check("stream-json" == after(t, "--output-format") and "--verbose" in t, "stream-json output")
-    check(after(t, "--tools").endswith("Bash") and "Bash(git commit:*)" in t and "Bash(git push:*)" in t and t.index("--disallowedTools") < t.index("Bash(git push:*)"), "tools, local git allowed, git push denied")
-    check("--model" not in t and "--effort" not in t, "no model or effort unless asked")
-    prof = section(out, "fence profile", "config checks")
-    lines = [x for x in prof.split("\n") if x]
-    check(f'(deny file-read* (subpath "{HOME}"))' in lines, "profile refuses reads in the home")
-    check(any(x.startswith(f'(deny file-write* (subpath "{HOME}")') for x in lines), "profile refuses writes in the home")
-    check(f'(allow file-read* (subpath "{PROJ}"))' in lines and f'(allow file-write* (subpath "{PROJ}"))' in lines, "first folder readable and writable")
-    check(f'(allow file-read* (subpath "{READ}"))' in lines and f'(allow file-write* (subpath "{READ}"))' not in lines, "--read folder readable only")
-    check(f'(deny file-read* (subpath "{FH}"))' in lines and f'(deny file-write* (subpath "{FH}"))' in lines, "the tool's own home refused")
-    check(f'(allow file-read* (subpath "{FH}/claude-config"))' in lines and f'(deny file-write* (subpath "{FH}/claude-config"))' in lines, "the CLI's config directory readable, and refused for writing as a whole")
-    state = [i for i, x in enumerate(lines) if x.startswith("(allow file-write*") and f'(subpath "{FH}/claude-config/projects")' in x]
-    check(len(state) == 1 and f'(subpath "{FH}/claude-config/sessions")' in lines[state[0]] and "claude-config/settings.json" not in lines[state[0]], "the config directory's state paths allowed back, the settings file not among them")
-    check(bool(state) and lines.index(f'(deny file-write* (subpath "{FH}/claude-config"))') < state[0], "the state allow comes after the config directory's deny, so it wins")
-    check(any(x.startswith("(deny file-write* (regex #") and "/projects/[^/]+/memory(/|$)" in x for x in lines), "memory folders under the transcripts refused")
-    check(lines.index(f'(deny file-read* (subpath "{HOME}"))') < lines.index(f'(allow file-read* (subpath "{PROJ}"))') < lines.index(f'(deny file-read* (subpath "{FH}"))'),
-          "later rules win: home deny, then folders, then the tool's home deny")
-    check(any(f'(literal "{HOME}/.zshrc")' in x and x.startswith("(allow file-read*") for x in lines) and any(f'"{HOME}/Library/Keychains"' in x for x in lines), "rc files and keychain allowed back")
-    check(any(x.startswith("(deny process-exec") and '"/usr/bin/osascript"' in x for x in lines), "osascript refused")
-    NO_FILTER = r"\((allow|deny) (file-[a-z-]+\*?|process-exec)\)"  # a rule with nothing listed would apply to everything
-    check(".ssh" not in prof and not any(re.fullmatch(NO_FILTER, x) for x in lines), "no .ssh allowed and no rule without a filter")
-    check("/Users/" not in prof.replace(HOME, ""), "no path but the temporary home in the profile")
-    MARK = re.compile(r'^\(deny network\* \(with message "siwithin-net:[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-run"\)\)$')  # the run's mark is its folder's name
-    di = [i for i, x in enumerate(lines) if MARK.match(x)]
-    check(len(di) == 1 and lines[di[0] + 1] == '(allow network-outbound (remote ip "localhost:<port>"))' and not any("(with report)" in x for x in lines) and lines.index("(allow default)") < di[0],
-          f"network 1: by default the profile refuses every socket under the run's mark, then allows the key proxy's loopback port, shown as <port> in a dry run: {[x for x in lines if 'network' in x]}")
-    check("ok     network: the run may open only the key proxy's loopback port; every other socket, DNS included, is refused by the fence" in out, "network 1b: the check line says what the wall refuses")
-    rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--network", "report"])
-    prof2 = section(out2, "fence profile", "config checks"); lines2 = [x for x in prof2.split("\n") if x]
-    check(rc2 == good_rc and sum(1 for x in lines2 if re.fullmatch(r'\(allow \(with report\) network\* \(with message "siwithin-net:[^"]+"\)\)', x)) == 1 and not any(x.startswith("(deny network") for x in lines2)
-          and "warn   network: open; every socket the run opens is reported in summary.json (network), nothing is refused: a survey, not a wall" in out2,
-          f"network 2: --network report: one allow-with-report rule under the mark, no deny, and the warn: {[x for x in lines2 if 'network' in x]}")
-    rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--network", "open"])
-    prof2 = section(out2, "fence profile", "config checks"); lines2 = [x for x in prof2.split("\n") if x]
-    check(rc2 == good_rc and not any("network" in x for x in lines2 if not x.startswith(";")) and '; the network: open and unreported ([fence] network = "open")' in lines2
-          and "warn   network: open and unreported; a run can send anything it can read to any host" in out2, "network 3: --network open: no network rule, the comment in its place, and the warn")
-    NH = os.path.join(TMP, "net-bad"); os.makedirs(NH); write(os.path.join(NH, "cap"), "10"); write(os.path.join(NH, "config.toml"), '[fence]\nnetwork = "wall"\n')
-    rc2, out2, err2 = tool_cli(["--home", NH, "--dir", PROJ, "--dry-run", "--budget", "1"])
-    check(rc2 == 1 and err2.strip() == "refused: config.toml: [fence] network must be one of proxy, report, open, not 'wall'" and "== command ==" not in out2, f"network 4: a config value outside the three is refused before anything is printed, naming the key: {err2.strip()!r}")
-    rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5"])
-    lines2 = [x for x in section(out2, "fence profile", "config checks").split("\n") if x]
-    check(rc2 == good_rc and any(MARK.match(x) for x in lines2), "network 4b: the next dry run on the default config is back to proxy mode")
-    bud = section(out, "budget", "\0")
-    check("$6.50 true over 2 runs" in bud and "$6.50 + $5.00 = $11.50 of $10.00" in bud and "REFUSED" in bud, "cap arithmetic printed: 6.50 + 5.00 passes 10.00")
-    rc, out, err = tool_cli(["--dir", PROJ, "--dry-run"])
-    check(rc == 1 and "ledger true total $6.50 + budget $5.00 passes the cap $10.00" in out, "over the cap: exit 1 and the reason in the checks")
-    rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5"])
-    check(rc == good_rc and "within the cap $10.00" in out and "worst case after this run: $6.50 + $3.50 = $10.00 of $10.00" in out, "6.50 + 3.50 = 10.00 is within a cap of 10 (the edge)")
-    rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "haiku"])
-    t = tokens(out)
-    check(after(t, "--model") == "claude-haiku-5-5" and after(t, "--max-budget-usd") == "3.5", "alias resolved; haiku budget 3.5 x factor 1 = 3.5 in the CLI's units")
-    check("0.1 / 0.125 / 0.01 / 0.5" in out and "(factor 1 between the CLI's units and true dollars)" in out, "rates and factor shown")
-    bud = section(out, "budget", "\0")
-    N = siwithin.NAME
-    rc, out, err = tool_cli(["--version"])
-    check(rc == 0 and out.strip() == "siwithin 0.5.0", f"--version prints siwithin 0.5.0: {out.strip()!r}")
-    check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
-    check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
-          "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
-    FH3 = os.path.join(TMP, "f40"); os.makedirs(FH3)
-    write(os.path.join(FH3, "cap"), "100"); write(os.path.join(FH3, "config.toml"), '[factors]\n"claude-haiku-5-5" = 40\n')
-    rc, out, err = tool_cli(["--home", FH3, "--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "haiku"])
-    check(after(tokens(out), "--max-budget-usd") == "140" and "(factor 40 between" in out and "2. by " + N + ", from the stream" in out, "a factor set in [factors] is honoured by the flag, and the streamed stop is still printed")
-    rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "not-priced"])
-    check(rc == good_rc and "the streamed stop cannot price it" in out and "no price for not-priced in [prices]: this stop cannot count it, and only the CLI's flag stops the run" in out,
-          "claude with a model that has no price: allowed, and the dry run says only the flag stops it")
-    rc, out, err = tool_cli(["--dir", PROJ, "--readonly", "--read", READ, "--dry-run", "--budget", "1"])
-    t = tokens(out); prof = section(out, "fence profile", "config checks")
-    check(after(t, "--tools") == "Read,Grep,Glob,WebSearch,WebFetch" and "Edit" not in t, "readonly: no editing tools, no shell")
-    check(f'(allow file-read* (subpath "{PROJ}"))' in prof and f'(allow file-write* (subpath "{PROJ}"))' not in prof, "readonly: nothing writable")
-    check(tool_cli(["--dir", PROJ, "--readonly", "--out", "x.md", "--dry-run"])[0] == 1, "--out with --readonly refused")
-    os.rename(os.path.join(FH, "cap"), os.path.join(FH, "cap.off"))
-    rc, out, err = tool_cli(["--dir", PROJ, "--dry-run"])
-    check(rc == 1 and "no readable cap" in out and "echo 20 >" in out, "no cap file: refused with the way to make one")
-    os.rename(os.path.join(FH, "cap.off"), os.path.join(FH, "cap"))
-    rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--out", "../escape.md"])
-    check(rc == 1 and "outside the run's folder" in err, "--out outside --dir refused")
+    if not DARWIN: print("-- dry runs through the real platform: skipped, their profile lines are macOS's; the Linux plan is checked below with the platform forced")
+    if DARWIN:
+        group("claude dry run")
+        rc, out, err = tool_cli(["--dir", PROJ, "--read", READ, "--dry-run"])  # the default budget of 5 is over what the ledger and cap leave: exit 1, everything still printed
+        check(rc == 1, f"claude dry run exit {rc}, stderr {err!r}")
+        t = tokens(out)
+        check(t[0] == siwithin.SANDBOX_EXEC and t[1] == "-f" and t[2].endswith("/fence.sb") and t[3] == "claude" and t[4] == "-p", f"command starts with the fence and the CLI: {t[:5]}")
+        check(after(t, "--max-turns") == "40" and after(t, "--max-budget-usd") == "5", "turn limit 40 and budget flag 5 (factor 1)")
+        check(t.count("--add-dir") == 2 and PROJ in t and READ in t, "both folders announced with --add-dir")
+        check("stream-json" == after(t, "--output-format") and "--verbose" in t, "stream-json output")
+        check(after(t, "--tools").endswith("Bash") and "Bash(git commit:*)" in t and "Bash(git push:*)" in t and t.index("--disallowedTools") < t.index("Bash(git push:*)"), "tools, local git allowed, git push denied")
+        check("--model" not in t and "--effort" not in t, "no model or effort unless asked")
+        prof = section(out, "fence profile", "config checks")
+        lines = [x for x in prof.split("\n") if x]
+        check(f'(deny file-read* (subpath "{HOME}"))' in lines, "profile refuses reads in the home")
+        check(any(x.startswith(f'(deny file-write* (subpath "{HOME}")') for x in lines), "profile refuses writes in the home")
+        check(f'(allow file-read* (subpath "{PROJ}"))' in lines and f'(allow file-write* (subpath "{PROJ}"))' in lines, "first folder readable and writable")
+        check(f'(allow file-read* (subpath "{READ}"))' in lines and f'(allow file-write* (subpath "{READ}"))' not in lines, "--read folder readable only")
+        check(f'(deny file-read* (subpath "{FH}"))' in lines and f'(deny file-write* (subpath "{FH}"))' in lines, "the tool's own home refused")
+        check(f'(allow file-read* (subpath "{FH}/claude-config"))' in lines and f'(deny file-write* (subpath "{FH}/claude-config"))' in lines, "the CLI's config directory readable, and refused for writing as a whole")
+        state = [i for i, x in enumerate(lines) if x.startswith("(allow file-write*") and f'(subpath "{FH}/claude-config/projects")' in x]
+        check(len(state) == 1 and f'(subpath "{FH}/claude-config/sessions")' in lines[state[0]] and "claude-config/settings.json" not in lines[state[0]], "the config directory's state paths allowed back, the settings file not among them")
+        check(bool(state) and lines.index(f'(deny file-write* (subpath "{FH}/claude-config"))') < state[0], "the state allow comes after the config directory's deny, so it wins")
+        check(any(x.startswith("(deny file-write* (regex #") and "/projects/[^/]+/memory(/|$)" in x for x in lines), "memory folders under the transcripts refused")
+        check(lines.index(f'(deny file-read* (subpath "{HOME}"))') < lines.index(f'(allow file-read* (subpath "{PROJ}"))') < lines.index(f'(deny file-read* (subpath "{FH}"))'),
+              "later rules win: home deny, then folders, then the tool's home deny")
+        check(any(f'(literal "{HOME}/.zshrc")' in x and x.startswith("(allow file-read*") for x in lines) and any(f'"{HOME}/Library/Keychains"' in x for x in lines), "rc files and keychain allowed back")
+        check(any(x.startswith("(deny process-exec") and '"/usr/bin/osascript"' in x for x in lines), "osascript refused")
+        check(".ssh" not in prof and not any(re.fullmatch(NO_FILTER, x) for x in lines), "no .ssh allowed and no rule without a filter")
+        check("/Users/" not in prof.replace(HOME, ""), "no path but the temporary home in the profile")
+        MARK = re.compile(r'^\(deny network\* \(with message "siwithin-net:[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}-run"\)\)$')  # the run's mark is its folder's name
+        di = [i for i, x in enumerate(lines) if MARK.match(x)]
+        check(len(di) == 1 and lines[di[0] + 1] == '(allow network-outbound (remote ip "localhost:<port>"))' and not any("(with report)" in x for x in lines) and lines.index("(allow default)") < di[0],
+              f"network 1: by default the profile refuses every socket under the run's mark, then allows the key proxy's loopback port, shown as <port> in a dry run: {[x for x in lines if 'network' in x]}")
+        check("ok     network: the run may open only the key proxy's loopback port; every other socket, DNS included, is refused by the fence" in out, "network 1b: the check line says what the wall refuses")
+        rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--network", "report"])
+        prof2 = section(out2, "fence profile", "config checks"); lines2 = [x for x in prof2.split("\n") if x]
+        check(rc2 == good_rc and sum(1 for x in lines2 if re.fullmatch(r'\(allow \(with report\) network\* \(with message "siwithin-net:[^"]+"\)\)', x)) == 1 and not any(x.startswith("(deny network") for x in lines2)
+              and "warn   network: open; every socket the run opens is reported in summary.json (network), nothing is refused: a survey, not a wall" in out2,
+              f"network 2: --network report: one allow-with-report rule under the mark, no deny, and the warn: {[x for x in lines2 if 'network' in x]}")
+        rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--network", "open"])
+        prof2 = section(out2, "fence profile", "config checks"); lines2 = [x for x in prof2.split("\n") if x]
+        check(rc2 == good_rc and not any("network" in x for x in lines2 if not x.startswith(";")) and '; the network: open and unreported ([fence] network = "open")' in lines2
+              and "warn   network: open and unreported; a run can send anything it can read to any host" in out2, "network 3: --network open: no network rule, the comment in its place, and the warn")
+        NH = os.path.join(TMP, "net-bad"); os.makedirs(NH); write(os.path.join(NH, "cap"), "10"); write(os.path.join(NH, "config.toml"), '[fence]\nnetwork = "wall"\n')
+        rc2, out2, err2 = tool_cli(["--home", NH, "--dir", PROJ, "--dry-run", "--budget", "1"])
+        check(rc2 == 1 and err2.strip() == "refused: config.toml: [fence] network must be one of proxy, report, open, not 'wall'" and "== command ==" not in out2, f"network 4: a config value outside the three is refused before anything is printed, naming the key: {err2.strip()!r}")
+        rc2, out2, err2 = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5"])
+        lines2 = [x for x in section(out2, "fence profile", "config checks").split("\n") if x]
+        check(rc2 == good_rc and any(MARK.match(x) for x in lines2), "network 4b: the next dry run on the default config is back to proxy mode")
+        bud = section(out, "budget", "\0")
+        check("$6.50 true over 2 runs" in bud and "$6.50 + $5.00 = $11.50 of $10.00" in bud and "REFUSED" in bud, "cap arithmetic printed: 6.50 + 5.00 passes 10.00")
+        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run"])
+        check(rc == 1 and "ledger true total $6.50 + budget $5.00 passes the cap $10.00" in out, "over the cap: exit 1 and the reason in the checks")
+        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5"])
+        check(rc == good_rc and "within the cap $10.00" in out and "worst case after this run: $6.50 + $3.50 = $10.00 of $10.00" in out, "6.50 + 3.50 = 10.00 is within a cap of 10 (the edge)")
+        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "haiku"])
+        t = tokens(out)
+        check(after(t, "--model") == "claude-haiku-5-5" and after(t, "--max-budget-usd") == "3.5", "alias resolved; haiku budget 3.5 x factor 1 = 3.5 in the CLI's units")
+        check("0.1 / 0.125 / 0.01 / 0.5" in out and "(factor 1 between the CLI's units and true dollars)" in out, "rates and factor shown")
+        bud = section(out, "budget", "\0")
+        N = siwithin.NAME
+        rc, out, err = tool_cli(["--version"])
+        check(rc == 0 and out.strip() == "siwithin 0.6.0", f"--version prints siwithin 0.6.0: {out.strip()!r}")
+        check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
+        check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
+              "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
+        FH3 = os.path.join(TMP, "f40"); os.makedirs(FH3)
+        write(os.path.join(FH3, "cap"), "100"); write(os.path.join(FH3, "config.toml"), '[factors]\n"claude-haiku-5-5" = 40\n')
+        rc, out, err = tool_cli(["--home", FH3, "--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "haiku"])
+        check(after(tokens(out), "--max-budget-usd") == "140" and "(factor 40 between" in out and "2. by " + N + ", from the stream" in out, "a factor set in [factors] is honoured by the flag, and the streamed stop is still printed")
+        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "not-priced"])
+        check(rc == good_rc and "the streamed stop cannot price it" in out and "no price for not-priced in [prices]: this stop cannot count it, and only the CLI's flag stops the run" in out,
+              "claude with a model that has no price: allowed, and the dry run says only the flag stops it")
+        rc, out, err = tool_cli(["--dir", PROJ, "--readonly", "--read", READ, "--dry-run", "--budget", "1"])
+        t = tokens(out); prof = section(out, "fence profile", "config checks")
+        check(after(t, "--tools") == "Read,Grep,Glob,WebSearch,WebFetch" and "Edit" not in t, "readonly: no editing tools, no shell")
+        check(f'(allow file-read* (subpath "{PROJ}"))' in prof and f'(allow file-write* (subpath "{PROJ}"))' not in prof, "readonly: nothing writable")
+        check(tool_cli(["--dir", PROJ, "--readonly", "--out", "x.md", "--dry-run"])[0] == 1, "--out with --readonly refused")
+        os.rename(os.path.join(FH, "cap"), os.path.join(FH, "cap.off"))
+        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run"])
+        check(rc == 1 and "no readable cap" in out and "echo 20 >" in out, "no cap file: refused with the way to make one")
+        os.rename(os.path.join(FH, "cap.off"), os.path.join(FH, "cap"))
+        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--out", "../escape.md"])
+        check(rc == 1 and "outside the run's folder" in err, "--out outside --dir refused")
 
-    group("forbidden folders")
-    write(os.path.join(FH, "config.toml"), f'[never]\nfolders = ["{HOME}/work/secret"]\n')
-    for rel in (".ssh", ".config/x", "Library/Application Support", ".claude", ".codex", "work/secret/deep", f".config/{siwithin.NAME}/runs"): os.makedirs(os.path.join(HOME, rel), exist_ok=True)
-    for label, folder in (("home root", HOME), ("~/.ssh", f"{HOME}/.ssh"), ("~/.config", f"{HOME}/.config/x"), ("~/Library", f"{HOME}/Library/Application Support"), ("~/.claude", f"{HOME}/.claude"),
-                          ("~/.codex", f"{HOME}/.codex"), ("[never] folder", f"{HOME}/work/secret/deep"), ("the tool's home", f"{FH}/runs"), ("parent of the home", os.path.dirname(HOME)),
-                          ("case variant", f"{HOME}/.SSH"), ("a folder holding a [never] one", f"{HOME}/work")):
-        for flag in ("--dir", "--read"):
-            args = ["--dir", folder, "--dry-run"] if flag == "--dir" else ["--dir", PROJ, "--read", folder, "--dry-run"]
-            rc, out, err = tool_cli(args)
-            if label == "case variant" and not os.path.isdir(folder): continue  # a case-sensitive volume: the folder does not exist
-            check(rc == 1 and err.startswith("refused:") and "== command ==" not in out, f"{flag} {label} refused ({err.strip()[:90]})")
-    rc, out, err = tool_cli(["--dir", os.path.join(HOME, "nope"), "--dry-run"])
-    check(rc == 1 and "is not a folder" in err, "a missing folder is refused")
-    os.remove(os.path.join(FH, "config.toml"))
+        group("forbidden folders")
+        write(os.path.join(FH, "config.toml"), f'[never]\nfolders = ["{HOME}/work/secret"]\n')
+        for rel in (".ssh", ".config/x", "Library/Application Support", ".claude", ".codex", "work/secret/deep", f".config/{siwithin.NAME}/runs"): os.makedirs(os.path.join(HOME, rel), exist_ok=True)
+        for label, folder in (("home root", HOME), ("~/.ssh", f"{HOME}/.ssh"), ("~/.config", f"{HOME}/.config/x"), ("~/Library", f"{HOME}/Library/Application Support"), ("~/.claude", f"{HOME}/.claude"),
+                              ("~/.codex", f"{HOME}/.codex"), ("[never] folder", f"{HOME}/work/secret/deep"), ("the tool's home", f"{FH}/runs"), ("parent of the home", os.path.dirname(HOME)),
+                              ("case variant", f"{HOME}/.SSH"), ("a folder holding a [never] one", f"{HOME}/work")):
+            for flag in ("--dir", "--read"):
+                args = ["--dir", folder, "--dry-run"] if flag == "--dir" else ["--dir", PROJ, "--read", folder, "--dry-run"]
+                rc, out, err = tool_cli(args)
+                if label == "case variant" and not os.path.isdir(folder): continue  # a case-sensitive volume: the folder does not exist
+                check(rc == 1 and err.startswith("refused:") and "== command ==" not in out, f"{flag} {label} refused ({err.strip()[:90]})")
+        rc, out, err = tool_cli(["--dir", os.path.join(HOME, "nope"), "--dry-run"])
+        check(rc == 1 and "is not a folder" in err, "a missing folder is refused")
+        os.remove(os.path.join(FH, "config.toml"))
 
-    group("codex dry run")
-    FH2 = os.path.join(TMP, "elsewhere"); os.makedirs(FH2)
-    write(os.path.join(FH2, "cap"), "50"); write(os.path.join(FH2, "config.toml"), '[prices]\n"made-up-1" = [1.0, 1.0, 0.5, 4.0]\n[fence]\nnetwork = "open"\n')
-    base = ["--home", FH2, "--adapter", "codex", "--dir", PROJ, "--dry-run"]
-    rc, out, err = tool_cli(base + ["--model", "gpt-5.3-codex"])
-    check(rc == 1 and "--soft-budget" in err and "== command ==" not in out, "codex: refused without --soft-budget, with the reason")
-    rc, out, err = tool_cli(base + ["--soft-budget"])
-    check(rc == 1 and "--model is needed" in err, "codex: refused without --model (priced by model id)")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "not-priced"])
-    check(rc == 1 and "no price for not-priced" in err, "codex: refused for a model with no price")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--turns", "3"])
-    check(rc == 1 and "no way to set a turn limit" in err, "codex: --turns refused, the CLI has none")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--effort", "high"])
-    check(rc == 1 and "effort_flag is unconfirmed" in err, "codex: --effort refused, the flag is unconfirmed")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--resume", "abc"])
-    check(rc == 1 and "resume_flag is unconfirmed" in err, "codex: --resume refused, the flag is unconfirmed")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--require-api-key"])
-    check(rc == 1 and "cannot be checked" in err, "codex: --require-api-key refused, no way to check")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--read", READ, "--budget", "2"])
-    check(rc == good_rc, f"codex dry run exit {rc}, stderr {err!r}")
-    t = tokens(out)
-    check(t[3] == "codex" and t[4:7] == ["exec", "--json", "--skip-git-repo-check"], f"codex: exec --json --skip-git-repo-check ({t[3:8]})")
-    check(after(t, "--model") == "gpt-5.3-codex" and after(t, "--cd") == PROJ and after(t, "--sandbox") == "workspace-write", "codex: model, --cd, workspace-write")
-    check(after(t, "--output-last-message").endswith("/last-message.txt") and t[-1] == "-", "codex: final message file, prompt from stdin by -")
-    check(not {"--max-budget-usd", "--max-turns", "--add-dir", "--effort"} & set(t), "codex: no budget flag, no turn flag, no --add-dir (it grants writes)")
-    prof = section(out, "fence profile", "config checks")
-    check(f'(allow file-write* (literal "{os.path.dirname(after(t, "-f"))}/last-message.txt"))' in prof or "last-message.txt" in prof, "codex: the one file it writes in the run's folder is allowed")
-    check(f'(deny file-read* (subpath "{FH2}"))' in prof and f'(allow file-read* (subpath "{FH2}/codex-config"))' in prof, "codex: --home moves the tool's home and the config directory with it")
-    check(not any('/runs/' in x and '/tmp")' in x for x in prof.split("\n")), "codex: no temp root in the run's folder (it has no variable for one)")
-    check("checked by siwithin when each turn ends" in out and "1.75 / 1.75 / 0.175 / 14.0" in out and "fields marked unconfirmed" in out and "not run against" not in out and "built from documentation" in out, "codex: budget mode, rates and the unconfirmed fields shown")
-    check("--read folders" in out or "not told about --read" in out, "codex: --read folder not announced to the CLI, said so")
-    rc, out, err = tool_cli(["--home", FH2, "--adapter", "codex", "--dir", PROJ, "--dry-run", "--soft-budget", "--model", "made-up-1"])
-    check(rc == good_rc and "1.0 / 1.0 / 0.5 / 4.0" in out, "codex: a price row from config.toml is merged in")
-    rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--budget", "2", "--network", "proxy"])
-    check(rc == 1 and 'refuse network: proxy ([fence] network) allows the run only the key proxy\'s port, and adapter codex has auth = "env", which starts no proxy; set network = "open" under [fence] or pass --network open' in out
-          and "== command ==" in out, "network 5: codex (auth = env) under network = proxy is refused in the checks, with the way out named; the plan is still printed")
-    rc, out, err = tool_cli(["--home", FH2, "--adapter", "nope", "--dir", PROJ, "--dry-run"])
-    check(rc == 1 and "unknown adapter" in err, "unknown adapter refused")
-    if not DARWIN:
-        check("refuses to run on" in tool_cli(["--dir", PROJ, "--dry-run"])[1], "non-macOS: the refusal and the roadmap are printed")
+        group("codex dry run")
+        FH2 = os.path.join(TMP, "elsewhere"); os.makedirs(FH2)
+        write(os.path.join(FH2, "cap"), "50"); write(os.path.join(FH2, "config.toml"), '[prices]\n"made-up-1" = [1.0, 1.0, 0.5, 4.0]\n[fence]\nnetwork = "open"\n')
+        base = ["--home", FH2, "--adapter", "codex", "--dir", PROJ, "--dry-run"]
+        rc, out, err = tool_cli(base + ["--model", "gpt-5.3-codex"])
+        check(rc == 1 and "--soft-budget" in err and "== command ==" not in out, "codex: refused without --soft-budget, with the reason")
+        rc, out, err = tool_cli(base + ["--soft-budget"])
+        check(rc == 1 and "--model is needed" in err, "codex: refused without --model (priced by model id)")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "not-priced"])
+        check(rc == 1 and "no price for not-priced" in err, "codex: refused for a model with no price")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--turns", "3"])
+        check(rc == 1 and "no way to set a turn limit" in err, "codex: --turns refused, the CLI has none")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--effort", "high"])
+        check(rc == 1 and "effort_flag is unconfirmed" in err, "codex: --effort refused, the flag is unconfirmed")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--resume", "abc"])
+        check(rc == 1 and "resume_flag is unconfirmed" in err, "codex: --resume refused, the flag is unconfirmed")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--require-api-key"])
+        check(rc == 1 and "cannot be checked" in err, "codex: --require-api-key refused, no way to check")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--read", READ, "--budget", "2"])
+        check(rc == good_rc, f"codex dry run exit {rc}, stderr {err!r}")
+        t = tokens(out)
+        check(t[3] == "codex" and t[4:7] == ["exec", "--json", "--skip-git-repo-check"], f"codex: exec --json --skip-git-repo-check ({t[3:8]})")
+        check(after(t, "--model") == "gpt-5.3-codex" and after(t, "--cd") == PROJ and after(t, "--sandbox") == "workspace-write", "codex: model, --cd, workspace-write")
+        check(after(t, "--output-last-message").endswith("/last-message.txt") and t[-1] == "-", "codex: final message file, prompt from stdin by -")
+        check(not {"--max-budget-usd", "--max-turns", "--add-dir", "--effort"} & set(t), "codex: no budget flag, no turn flag, no --add-dir (it grants writes)")
+        prof = section(out, "fence profile", "config checks")
+        check(f'(allow file-write* (literal "{os.path.dirname(after(t, "-f"))}/last-message.txt"))' in prof or "last-message.txt" in prof, "codex: the one file it writes in the run's folder is allowed")
+        check(f'(deny file-read* (subpath "{FH2}"))' in prof and f'(allow file-read* (subpath "{FH2}/codex-config"))' in prof, "codex: --home moves the tool's home and the config directory with it")
+        check(not any('/runs/' in x and '/tmp")' in x for x in prof.split("\n")), "codex: no temp root in the run's folder (it has no variable for one)")
+        check("checked by siwithin when each turn ends" in out and "1.75 / 1.75 / 0.175 / 14.0" in out and "fields marked unconfirmed" in out and "not run against" not in out and "built from documentation" in out, "codex: budget mode, rates and the unconfirmed fields shown")
+        check("--read folders" in out or "not told about --read" in out, "codex: --read folder not announced to the CLI, said so")
+        rc, out, err = tool_cli(["--home", FH2, "--adapter", "codex", "--dir", PROJ, "--dry-run", "--soft-budget", "--model", "made-up-1"])
+        check(rc == good_rc and "1.0 / 1.0 / 0.5 / 4.0" in out, "codex: a price row from config.toml is merged in")
+        rc, out, err = tool_cli(base + ["--soft-budget", "--model", "gpt-5.3-codex", "--budget", "2", "--network", "proxy"])
+        check(rc == 1 and 'refuse network: proxy ([fence] network) allows the run only the key proxy\'s port, and adapter codex has auth = "env", which starts no proxy; set network = "open" under [fence] or pass --network open' in out
+              and "== command ==" in out, "network 5: codex (auth = env) under network = proxy is refused in the checks, with the way out named; the plan is still printed")
+        rc, out, err = tool_cli(["--home", FH2, "--adapter", "nope", "--dir", PROJ, "--dry-run"])
+        check(rc == 1 and "unknown adapter" in err, "unknown adapter refused")
+    if not DARWIN and not LINUX:
+        check("refuses to run on" in tool_cli(["--dir", PROJ, "--dry-run"])[1], "other platforms: the refusal and the roadmap are printed")
 
     # ---------------------------------------------------------------- part 2: pieces
     group("pieces")
@@ -1157,9 +1534,12 @@ try:
     write(os.path.join(TMP, "l.md"), "# header with true $9 in it\n2026-10-01 09:00 | a | /x | y | z | true $1.5000 | done\nnot a line | true $7\n2026-10-02 09:00 | b | true $0.2500 (ceiling)\n")
     check(siwithin.ledger_total(os.path.join(TMP, "l.md")) == (1.75, 2), "ledger total counts dated lines only")
 
+    linux_tests()
+
     # ---------------------------------------------------------------- part 3: whole runs against fake CLIs
-    if DARWIN:
-        group("whole runs, fake CLIs")
+    for PLAT in (["darwin"] if DARWIN else []) + ["linux"]:
+        TMP = os.path.join(TMP_ROOT, "pass-" + PLAT); os.makedirs(TMP)  # a folder of its own: the pass leaves homes and copies behind that the next would meet
+        group("whole runs, fake CLIs" + (", Linux: siwithin.PLATFORM forced, the bubblewrap shim" if PLAT == "linux" else ""))
         E = os.path.join(TMP, "e2e"); EH = os.path.join(E, "home"); EF = os.path.join(EH, ".config", siwithin.NAME); BIN = os.path.join(E, "bin"); ED = os.path.join(EH, "proj")
         for p in (EF, BIN, ED): os.makedirs(p)
         write(os.path.join(EF, "cap"), "100")
@@ -1167,6 +1547,9 @@ try:
         write(os.path.join(EF, "config.toml"), '[adapters.claude]\nauth = "env"\nenv_pass = ["ANTHROPIC_API_KEY", "FAKE_AUTH"]   # the fake CLI is told how to answer through a listed variable\n[fence]\nnetwork = "open"   # auth = env starts no proxy, so the network stays as it was\n')
         shim =os.path.join(BIN, "sandbox-shim")
         write(shim, f"#!{sys.executable}\nimport os, sys\nassert sys.argv[1] == '-f' and os.path.isfile(sys.argv[2])\nos.execv(sys.argv[3], sys.argv[3:])\n")
+        bwshim, socat_dummy, bw_calls = os.path.join(BIN, "bwrap-shim"), os.path.join(BIN, "socat-dummy"), os.path.join(E, "bwrap-calls.txt")
+        write(bwshim, f"#!{sys.executable}\n" + BWSHIM.replace("@CALLS@", repr(bw_calls)).replace("@SOCK@", repr(siwithin.PROXY_SOCK)).replace("@SOCAT@", repr(socat_dummy)))
+        write(socat_dummy, "#!/bin/sh\nexit 0\n")  # SOCAT only has to exist: the shim strips the line that would start it
         logshim = os.path.join(BIN, "log-shim")  # stands in for /usr/bin/log: a fake run leaves nothing in the kernel's report, so canned lines under the run's mark come back, the CLI's pid on them
         write(logshim, f"#!{sys.executable}\n" + LOGSHIM.replace("@CALLS@", repr(os.path.join(E, "log-calls.txt"))).replace("@EH@", repr(EH)))
         write(os.path.join(BIN, "claude"), f"""#!{sys.executable}
@@ -1213,22 +1596,26 @@ open(a[a.index("--output-last-message") + 1], "w").write("codex says DONE-MARKER
 ev({{"type": "turn.completed", "usage": {{"input_tokens": 1000000, "cached_input_tokens": 500000, "output_tokens": 100000, "reasoning_output_tokens": 0}}}})
 if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
 """)
-        for p in ("sandbox-shim", "log-shim", "claude", "codex"): os.chmod(os.path.join(BIN, p), 0o755)
+        for p in ("sandbox-shim", "bwrap-shim", "socat-dummy", "log-shim", "claude", "codex"): os.chmod(os.path.join(BIN, p), 0o755)
         write(os.path.join(BIN, "fake-ps"), f"#!{sys.executable}\n" + FAKE_PS); os.chmod(os.path.join(BIN, "fake-ps"), 0o755)
-        REAL_PS = ps_works(siwithin.PS)  # every run below looks at the process table: with no working ps each would carry a note
-        if not REAL_PS: siwithin.PS = os.path.join(BIN, "fake-ps")
-        print("   (the kill walk's checks run against " + ("the real ps)" if REAL_PS else f"a stand-in for ps, because the real one cannot be run here; the stand-in works: {ps_works(siwithin.PS)})"))
+        REAL_PS = ps_works(PS_PATH)  # every run below looks at the process table: with no working ps each would carry a note
+        FORCED = DARWIN and PLAT == "linux"  # macOS's ps cannot be trusted with procps's arguments: the stand-in answers them from the real process table
+        siwithin.PS = os.path.join(BIN, "fake-ps") if (not REAL_PS or FORCED) else PS_PATH
+        print("   (the kill walk's checks run against " + ("the real ps)" if siwithin.PS == PS_PATH else f"a stand-in for ps, because " + ("the real one is macOS's and the pass is Linux's" if REAL_PS else "the real one cannot be run here") + f"; the stand-in works: {ps_works(siwithin.PS)})"))
         saved_env, saved_stdin, saved_sb, saved_log = dict(os.environ), sys.stdin, siwithin.SANDBOX_EXEC, (siwithin.LOG_BIN, siwithin.LOG_WAIT)
+        saved_plat = (siwithin.PLATFORM, siwithin.BWRAP, siwithin.SOCAT)
         SECRET = "sk-test-NOT-A-REAL-KEY-12345"
 
         def whole(args, brief="do the thing\n", extra_env=None):
             env = {"HOME": EH, "PATH": BIN + ":/usr/bin:/bin", "USER": "t", "ANTHROPIC_API_KEY": SECRET, "CODEX_API_KEY": SECRET, "UNLISTED_VARIABLE": "x", **(extra_env or {})}
             os.environ.clear(); os.environ.update({k: v for k, v in env.items() if v is not None})  # a None in extra_env leaves the variable out
             sys.stdin = io.StringIO(brief); siwithin.SANDBOX_EXEC = shim; siwithin.LOG_BIN, siwithin.LOG_WAIT = logshim, 0
+            if PLAT == "linux": siwithin.PLATFORM, siwithin.BWRAP, siwithin.SOCAT = "linux", bwshim, socat_dummy
             o, e = io.StringIO(), io.StringIO(); so, se = sys.stdout, sys.stderr; sys.stdout, sys.stderr = o, e
             try: rc = siwithin.main(args)
             finally:
                 sys.stdout, sys.stderr = so, se; os.environ.clear(); os.environ.update(saved_env); sys.stdin = saved_stdin; siwithin.SANDBOX_EXEC = saved_sb; siwithin.LOG_BIN, siwithin.LOG_WAIT = saved_log
+                siwithin.PLATFORM, siwithin.BWRAP, siwithin.SOCAT = saved_plat
             return rc, o.getvalue(), e.getvalue()
 
         def last_run(home=EF):
@@ -1246,7 +1633,9 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(abs(s["true_cost"] - 0.30) < 1e-9 and s["cli_cost"] == 0.3 and s["turns"] == 3 and s["tokens_in"] == 100000 and s["tokens_out"] == 10000, f"cost, turns, tokens in the summary: {s}")
         check(s["key_source"] == "ANTHROPIC_API_KEY" and s["session_id"] == "sess-1" and s["cli_version"] == "2.1.296" and not s["notes"], f"key source, session, CLI version, no notes: {s['notes']}")
         check(s["network"] == {"mode": "open", "mark": None, "refused": 0, "reported": 0, "targets": {}, "processes": {}, "cli": 0, "others": 0, "unparsed": 0, "late": 0, "note": "unreported"} and "network: open, unreported" in out
-              and '; the network: open and unreported ([fence] network = "open")' in open(os.path.join(last_run()[0], "fence.sb")).read() and "network: open\n" in open(os.path.join(last_run()[0], "command.txt")).read()
+              and ('; the network: open and unreported ([fence] network = "open")' in open(os.path.join(last_run()[0], "fence.sb")).read() if PLAT == "darwin"
+                   else open(os.path.join(last_run()[0], "fence.sb")).read().startswith(siwithin.FENCE_HEAD + "\n--ro-bind\n/\n/\n") and "--unshare-net" not in open(os.path.join(last_run()[0], "fence.sb")).read().split("\n"))
+              and "network: open\n" in open(os.path.join(last_run()[0], "command.txt")).read()
               and not os.path.exists(os.path.join(E, "log-calls.txt")), f"network 13: an auth = env home with network = open: the comment in fence.sb, no read of the kernel's report, the figures say unreported: {s.get('network')}")
         check(s["contract"] == {"done": {"text": "DONE-MARKER", "found": True}, "absent": {"text": "TODO", "found": False}}, "--done found, --absent not found")
         check(open(os.path.join(ED, "out", "result.txt")).read() == "All good. DONE-MARKER" and open(os.path.join(r, "result.md")).read() == "All good. DONE-MARKER", "--out written inside --dir, result.md written")
@@ -1354,7 +1743,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.5.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
@@ -1468,15 +1857,16 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
             rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", bad])
             check(rc == 1 and "--budget, --turns and --timeout must be above zero" in err, f"money 5: --budget {bad} keeps today's refusal")
 
-        group("the walls: deny_exec")
-        rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "1"])
-        lines = [x for x in section(out, "fence profile", "config checks").split("\n") if x]
-        exec_rule = [x for x in lines if x.startswith("(deny process-exec")]
-        NEW_EXEC = ("/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch")
-        check(len(exec_rule) == 1 and all(f'(literal "{p}")' in exec_rule[0] for p in NEW_EXEC + ("/usr/bin/osascript", "/usr/bin/open")) and siwithin.DEFAULT_CONFIG["fence"]["deny_exec"][-4:] == list(NEW_EXEC),
-              f"deny 1: the fence profile carries launchctl, crontab, at and batch beside the five it had: {exec_rule}")
-        check(siwithin.parse_toml_mini(example)["fence"]["deny_exec"] == siwithin.DEFAULT_CONFIG["fence"]["deny_exec"] and siwithin.parse_toml_mini(example)["auth"]["paths"] == ["/v1/messages", "/v1/messages/count_tokens"],
-              "deny 2: config.example.toml lists the same programs and the same [auth] paths as the built-in defaults")
+        if PLAT == "darwin":  # the real dry run, a subprocess on the real platform
+            group("the walls: deny_exec")
+            rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "1"])
+            lines = [x for x in section(out, "fence profile", "config checks").split("\n") if x]
+            exec_rule = [x for x in lines if x.startswith("(deny process-exec")]
+            NEW_EXEC = ("/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at", "/usr/bin/batch")
+            check(len(exec_rule) == 1 and all(f'(literal "{p}")' in exec_rule[0] for p in NEW_EXEC + ("/usr/bin/osascript", "/usr/bin/open")) and siwithin.DEFAULT_CONFIG["fence"]["deny_exec"][-4:] == list(NEW_EXEC),
+                  f"deny 1: the fence profile carries launchctl, crontab, at and batch beside the five it had: {exec_rule}")
+            check(siwithin.parse_toml_mini(example)["fence"]["deny_exec"] == siwithin.DEFAULT_CONFIG["fence"]["deny_exec"] and siwithin.parse_toml_mini(example)["auth"]["paths"] == ["/v1/messages", "/v1/messages/count_tokens"],
+                  "deny 2: config.example.toml lists the same programs and the same [auth] paths as the built-in defaults")
         show[0] = False
 
         group("the walls: red briefs, scorer proven")
@@ -1489,8 +1879,9 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
     show[0] = True
     try: reconcile_tests()
     finally: show[0] = False
+    linux_real_tests()
 finally:
-    shutil.rmtree(TMP, ignore_errors=True)
+    shutil.rmtree(TMP_ROOT, ignore_errors=True)
 
 print(f"\n{count - len(failures)} of {count} checks passed" + ("" if DARWIN else " (macOS-only checks skipped)"))
 if failures:
