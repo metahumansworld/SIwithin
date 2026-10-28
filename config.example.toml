@@ -118,7 +118,7 @@ auth_status_args = ["auth", "status"]                # arguments that make the C
 auth_methods_ok = ["api_key", "api_key_helper"]      # authMethod values that mean an API key is billed
 key_sources_ok = ["apiKeyHelper", "ANTHROPIC_API_KEY"]  # values of the init event's key source that mean an API key is billed
 require_api_key = true                               # refuse unless the CLI bills an API key and not a login, when --require-api-key is not given
-measured = ["2.1.284", "2.1.296"]                    # CLI versions the adapter was run on; another version gets a note in the summary
+measured = ["2.1.284", "2.1.296", "2.1.302", "2.1.310"]  # CLI versions the adapter was run on; another version gets a note in the summary
 unconfirmed = []                                     # assumptions about the CLI not confirmed from its documentation, listed in every dry run and summary
 
 [adapters.claude.aliases]

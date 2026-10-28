@@ -1127,10 +1127,10 @@ def linux_tests():
     check("--unshare-net" in a and "--unshare-net" not in a_open and not any(x.endswith("proxy.sock") for x in a_open) and ("--ro-bind", ("/h/work/proj-x", "/h/work/proj-x")) in parse_bwrap(a_open)
           and ("--bind", ("/h/work/proj-x", "/h/work/proj-x")) not in parse_bwrap(a_open) and "--new-session" not in a and "--cap-add" not in " ".join(a) and "--die-with-parent" in a,
           "fence_args 6: --unshare-net only for proxy, no socket bind for open, a readonly run's first folder bound read-only, no --new-session and no capability added")
-    a_odd = siwithin.fence_args(mk(folders=["/h/work/my_proj"]))
-    check(not any(v and "my_proj" in v[0] and v[0].endswith("memory") for o, v in parse_bwrap(a_odd)) and sum(1 for o, v in parse_bwrap(a_odd) if v[:1] and v[0].endswith("/memory")) == 1 and siwithin.project_dir_name("/h/work/my_proj") is None
-          and siwithin.project_dir_name("/h/work/proj-x") == "-h-work-proj-x",
-          "fence_args 7: a folder with a character outside letters, digits, / and - is given no memory bind of its own: the CLI's name for it was not seen")
+    a_odd = siwithin.fence_args(mk(folders=["/home/user.name/my_proj"])); own_odd = CD + "/projects/-home-user-name-my-proj/memory"
+    check(("--ro-bind", (own_odd, own_odd)) in parse_bwrap(a_odd) and sum(1 for o, v in parse_bwrap(a_odd) if v[:1] and v[0].endswith("/memory")) == 2 and siwithin.project_dir_name("/h/work/proj-x") == "-h-work-proj-x"
+          and siwithin.project_dir_name("/" + "a" * 199) == "-" + "a" * 199 and siwithin.project_dir_name("/" + "a" * 200) is None and siwithin.project_dir_name("/h/work/my_proj") == "-h-work-my-proj",
+          "fence_args 7: a folder with a . or a _ in its path gets a memory bind under the CLI's name for it, every character outside letters and digits written as -; past 200 characters the CLI adds a hash, so no name and no bind")
     try: siwithin.fence_args(mk(folders=["/h/work/bad\nname"])); bad = None
     except siwithin.Refused as x: bad = str(x)
     check(bad is not None and "control character" in bad, f"fence_args 8: a path with a control character is refused: {bad!r}")
@@ -1365,7 +1365,7 @@ try:
         bud = section(out, "budget", "\0")
         N = siwithin.NAME
         rc, out, err = tool_cli(["--version"])
-        check(rc == 0 and out.strip() == "siwithin 0.6.0", f"--version prints siwithin 0.6.0: {out.strip()!r}")
+        check(rc == 0 and out.strip() == "siwithin 0.6.1", f"--version prints siwithin 0.6.1: {out.strip()!r}")
         check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
         check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
               "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -1743,7 +1743,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.0" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.1" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()

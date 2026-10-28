@@ -40,7 +40,7 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 BWRAP = "/usr/bin/bwrap"  # Linux's fence: absolute and a module constant, for the reasons SANDBOX_EXEC is
 SOCAT = "/usr/bin/socat"  # Linux, network = "proxy": the bridge from the run's loopback port to the key proxy's Unix socket, started inside the run's network namespace
@@ -118,7 +118,7 @@ DEFAULT_CONFIG = {
             "args_readonly": ["--tools", ",".join(CLAUDE_READ_TOOLS), "--allowedTools", *CLAUDE_READ_TOOLS, "--disallowedTools", *CLAUDE_DENY],
             "extra_args": [], "version_args": ["--version"], "auth_status_args": ["auth", "status"],
             "auth_methods_ok": ["api_key", "api_key_helper"], "key_sources_ok": ["apiKeyHelper", "ANTHROPIC_API_KEY"], "require_api_key": True,
-            "measured": ["2.1.284", "2.1.296"], "unconfirmed": [],
+            "measured": ["2.1.284", "2.1.296", "2.1.302", "2.1.310"], "unconfirmed": [],
             "aliases": {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"},
         },
         "codex": {
@@ -651,7 +651,7 @@ def network_line(n):
 def fence_profile(c):
     """c: home, folders (the first writable unless readonly), readonly, siwithin_home, config_dir, run, tmp (bool), last_message (bool), fence (config section), read_extra, write_extra."""
     home, f = c.home, c.fence
-    reads = [os.path.join(home, r) for r in f["read_home"]] + list(c.read_extra)
+    reads = list(dict.fromkeys([os.path.join(home, r) for r in f["read_home"]] + list(c.read_extra)))  # each once: a CLI's folder can be named by the adapter's read_home and found again by the binary's path
     writes = [os.path.join(home, w) for w in f["write_home"]] + list(c.write_extra)
     head = SB_TEMPLATE.replace("@NAME@", NAME)
     head = (head.replace("@DENY_WRITE@", sb_rule("deny", "file-write*", sub(home), *[sub(r) for r in f["deny_write"]]))
@@ -685,9 +685,11 @@ def fence_profile(c):
 
 
 def project_dir_name(folder):
-    """The name the CLI gives a folder's transcript folder under projects/: the path with each / written as -, as on every transcript folder in the red home's config directory.
-    That settles it for a path of letters, digits, / and - only; for any other character the CLI's rule was not seen, so the name is None."""
-    return folder.replace("/", "-") if re.fullmatch(r"/[A-Za-z0-9/-]*", folder) else None
+    """The name the CLI gives a folder's transcript folder under projects/: every character outside letters and digits written as -. Read in the CLI's own code (2.1.302 and 2.1.310, 28 October 2026)
+    and matching every transcript folder seen, the first Linux run's (a . in its path) among them. Past 200 characters the CLI keeps the first 200 and adds a hash of the path, not reproduced here,
+    so for such a folder the name is None and no memory folder is made first. With a config directory of its own, as a run's is, the CLI applies this rule and no other."""
+    name = re.sub(r"[^A-Za-z0-9]", "-", folder)
+    return name if len(name) <= 200 else None
 
 
 def fence_needs(c):
@@ -707,7 +709,7 @@ def fence_args(c):
     a later bind over an earlier mount wins, as a later rule does in the profile. Pure: nothing is created (fence_needs says what is)."""
     home, f = c.home, c.fence
     a = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", home]  # the tree readable and not writable, a private /tmp, the home empty
-    for p in [os.path.join(home, r) for r in f["read_home"] + f["rc_files"]] + list(c.read_extra): a += ["--ro-bind-try", p, p]  # allowed back out of the empty home, each if it exists
+    for p in dict.fromkeys([os.path.join(home, r) for r in f["read_home"] + f["rc_files"]] + list(c.read_extra)): a += ["--ro-bind-try", p, p]  # allowed back out of the empty home, each if it exists, each once
     for p in [os.path.join(home, w) for w in f["write_home"]] + list(c.write_extra): a += ["--bind-try", p, p]
     for i, d in enumerate(c.folders): a += ["--bind" if i == 0 and not c.readonly else "--ro-bind", d, d]  # the run's folders: the first writable unless readonly
     a += ["--tmpfs", c.siwithin_home]  # the tool's own home stays refused, config, cap, ledger and other runs included; back in, from the run's own folder, only:
@@ -938,8 +940,8 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
         with open(P.cap_path, encoding="utf-8") as f: P.cap = float(f.read().strip())
     except (OSError, ValueError) as x: P.cap = None; chk("refuse", f"no readable cap in {P.cap_path} ({x}); write the dollars all runs together may spend, e.g.  echo 20 > {P.cap_path}")
     if P.cap is not None:
-        if P.total + P.budget > P.cap: chk("refuse", f"ledger true total ${P.total:.2f} + budget {money(P.budget)} passes the cap ${P.cap:.2f} in {P.cap_path}")
-        else: chk("ok", f"cap: ledger true total ${P.total:.2f} + budget {money(P.budget)} is within the cap ${P.cap:.2f}")
+        if P.total + P.budget > P.cap: chk("refuse", f"ledger true total {money(P.total)} + budget {money(P.budget)} passes the cap {money(P.cap)} in {P.cap_path}")
+        else: chk("ok", f"cap: ledger true total {money(P.total)} + budget {money(P.budget)} is within the cap {money(P.cap)}")
 
     # environment, config dir, CLI
     P.siwithin_home, P.home = siwithin_home, home
@@ -1065,7 +1067,7 @@ def show_plan(P):
     if P.cap is None: pr(f"cap: unreadable ({P.cap_path})")
     else:
         after = P.total + P.budget
-        pr(f"ledger: ${P.total:.2f} true over {P.nruns} runs ({P.ledger_path})\ncap: ${P.cap:.2f}\nworst case after this run: ${P.total:.2f} + {money(P.budget)} = ${after:.2f} of ${P.cap:.2f}, "
+        pr(f"ledger: {money(P.total)} true over {P.nruns} runs ({P.ledger_path})\ncap: {money(P.cap)}\nworst case after this run: {money(P.total)} + {money(P.budget)} = {money(after)} of {money(P.cap)}, "
            + (f"within the cap, ${P.cap - after:.2f} left" if after <= P.cap else f"over the cap by ${after - P.cap:.2f}: REFUSED"))
 
 
@@ -1826,7 +1828,7 @@ def run_cli(P, cfg, proxy):
         f.write(f"{t0.strftime('%Y-%m-%d %H:%M')} | {P.slug} | {d} | {first} | runs/{os.path.basename(run)} | {clean(status)}" + (f" | receipt {receipt}" if receipt else "") + "\n")
     total, _ = ledger_total(P.ledger_path)
     print(f"{NAME} {status} | {P.adapter} {P.label} {P.effort or '-'} | {st['turns'] or '-'} turns | {mins:.1f} min | {ccost} | {tcost} | in {tin // 1000}k out {tout // 1000}k"
-          f" | paid by {st['key_source'] or '-'} | denials {len(st['denials'])} | ledger true total ${total:.2f} of cap ${P.cap:.2f}\nrun: {run}\nsession: {st['session']}"
+          f" | paid by {st['key_source'] or '-'} | denials {len(st['denials'])} | ledger true total {money(total)} of cap {money(P.cap)}\nrun: {run}\nsession: {st['session']}"
           + (f"\nreceipt: {receipt}" if receipt else "") + (f"\nout: {out_path}" if out_path else "") + "\n" + network_line(net), flush=True)
     if "done" in contract: print(f"done text {contract['done']['text']!r}: " + ("found" if contract["done"]["found"] else "MISSING"))
     if "absent" in contract: print(f"absent text {contract['absent']['text']!r}: " + ("FOUND" if contract["absent"]["found"] else "not in the result"))
