@@ -40,7 +40,7 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 BWRAP = "/usr/bin/bwrap"  # Linux's fence: absolute and a module constant, for the reasons SANDBOX_EXEC is
 SOCAT = "/usr/bin/socat"  # Linux, network = "proxy": the bridge from the run's loopback port to the key proxy's Unix socket, started inside the run's network namespace

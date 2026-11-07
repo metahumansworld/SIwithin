@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.2, 2026-11-08
+
+- 2026-11-08: released. `--version` prints `siwithin 0.6.2`; the smoke test passes 469 checks on macOS (one more than 0.6.1's run of the same suite on 28 October, from the machine's state on 8 November, not from a change in the suite) and 247 on Linux with fake CLIs, the red fake pass 92 on both. No code changed but the version.
+- 2026-11-08: `--reconcile` ran against the live Admin API for the first time, by the maintainer with an Admin key made that day, on the test home whose ledger holds the suite's real runs of October: over the 18 October run's fifteen minutes by the minute, provider $0.0273, runs $0.0273, every bucket `ok`; over 13 October to 8 November by the day, provider $170.88 across the organisation's seven keys, runs $0.11, the rest `unaccounted` in 14 days and `over` in 3, exit 1, and `claude-sonnet-5` reported `unpriced` for want of a `[prices]` line. README (Reconcile, Status) and SECURITY.md say so where they said the live API had not been reached.
+
 ## v0.6.1, 2026-10-28
 
 - 2026-10-28: released. `--version` prints `siwithin 0.6.1`; the smoke test passes 468 checks on macOS and 247 on Linux with fake CLIs, the red fake pass 92 on both. The real CLI ran under the Linux fence for the first time on 26 October 2026, after the 0.6.0 release, in the same Ubuntu 24.04 VM by the maintainer with a key made for it: Claude Code 2.1.310, Haiku, a two-turn brief, two requests through the socat bridge and the key proxy, $0.0012 by the CLI's count and the proxy's, no denial, nothing outlived the run, the receipt verified (README, Status; SECURITY.md, Not verified). README, SECURITY.md and `STOLEN-KEYS.md` say so where they said the real CLI had not run, and `STOLEN-KEYS.md` no longer says macOS only.
