@@ -3,7 +3,7 @@
 """SIwithin: run an agent CLI headless on a brief, inside a folder fence, under a dollar budget and a cap, leaving one record per run.
 
 Usage: python3 siwithin.py --dir <folder> [--adapter claude|codex] [--model M] [--effort E] [--budget 5] [--turns 40] [--timeout 2700]
-       [--read <folder>]... [--readonly] [--name <slug>] [--out <file, inside --dir>] [--resume <session id>]
+       [--read <folder>]... [--readonly] [--name <slug>] [--resume <session id>]
        [--done "<text>"] [--absent "<text>"] [--soft-budget] [--require-api-key | --no-require-api-key]
        [--home <folder>] [--dry-run] < brief
        siwithin.py --verify [<run folder>] [--expect <hash>] [--home <folder>]
@@ -40,7 +40,7 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 BWRAP = "/usr/bin/bwrap"  # Linux's fence: absolute and a module constant, for the reasons SANDBOX_EXEC is
 SOCAT = "/usr/bin/socat"  # Linux, network = "proxy": the bridge from the run's loopback port to the key proxy's Unix socket, started inside the run's network namespace
@@ -709,6 +709,8 @@ def fence_args(c):
     a later bind over an earlier mount wins, as a later rule does in the profile. Pure: nothing is created (fence_needs says what is)."""
     home, f = c.home, c.fence
     a = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", home]  # the tree readable and not writable, a private /tmp, the home empty
+    for p in ("/run", "/var/run"):  # the host's runtime sockets (D-Bus, systemd, others) hidden: a network namespace does not stop a connect to a socket on a shared mount, a read-only mount does not either
+        if os.path.isdir(p) and not os.path.islink(p): a += ["--tmpfs", p]  # /var/run is a link to /run on most systems, covered by the first; the proxy's socket is bound under /tmp, not here
     for p in dict.fromkeys([os.path.join(home, r) for r in f["read_home"] + f["rc_files"]] + list(c.read_extra)): a += ["--ro-bind-try", p, p]  # allowed back out of the empty home, each if it exists, each once
     for p in [os.path.join(home, w) for w in f["write_home"]] + list(c.write_extra): a += ["--bind-try", p, p]
     for i, d in enumerate(c.folders): a += ["--bind" if i == 0 and not c.readonly else "--ro-bind", d, d]  # the run's folders: the first writable unless readonly
@@ -843,7 +845,7 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     P.budget = o.budget if o.budget is not None else float(d["budget"])
     P.timeout = o.timeout if o.timeout is not None else int(d["timeout"])
     if P.budget <= 0 or P.timeout <= 0 or (o.turns is not None and o.turns <= 0): raise Refused("--budget, --turns and --timeout must be above zero")
-    if o.out and o.readonly: raise Refused("--out with --readonly: a readonly run leaves its folder as it found it; take the result from the run's result.md")
+    if o.out: raise Refused(f"--out is not written since 0.6.3: the result is in the run folder's result.md, named on the ledger line and the summary's run: line; a path inside --dir is one the CLI can replace with a link during the run, and {NAME} writes nowhere the CLI can point it")
     P.slug = slugify(o.name); P.effort = o.effort; P.label = o.model or "default"  # the label is what was typed, an alias or an id, as in the ledger line
 
     def need(field, what):
@@ -1017,11 +1019,6 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     P.fence_list = fence_args(P.fence_c) if PLATFORM == "linux" else None
     P.profile = fence_text(P.fence_list) if PLATFORM == "linux" else fence_profile(P.fence_c)
     P.sb_path = os.path.join(run, "fence.sb")
-    P.out_path = None
-    if o.out:
-        cand = os.path.realpath(os.path.join(dirs[0], os.path.expanduser(o.out)))
-        if not under(cand, dirs[0]) or cand == dirs[0]: raise Refused(f"--out {o.out} resolves to {cand}, outside the run's folder {dirs[0]}; {NAME} writes nowhere else")
-        P.out_path = cand
     P.done_text, P.absent_text = o.done, o.absent
     P.measured = ad["measured"]
     P.prices_read_on = ro or "unknown"
@@ -1211,7 +1208,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if not 0 <= n <= MAX_BODY: return self.error(400 if n < 0 else 413, "invalid_request_error", "bad Content-Length" if n < 0 else "request body too large")
         body = self.rfile.read(n) if n else b""  # exactly Content-Length bytes
         if len(body) < n: self.close_connection = True; return
-        model = None
+        model, admitted = None, False
         if is_messages(path):
             try: j = json.loads(body); model = j.get("model") if isinstance(j, dict) and isinstance(j.get("model"), str) else None
             except ValueError: pass
@@ -1221,7 +1218,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.error(402, "billing_error", wall, close=False)
                 if call: px.on_wall(f"killed: {wall}")  # the first refusal stops the run, once the refusal is on its way
                 return
-        # forward: the same method, path, query and body; the same headers but the host, the key and the hop-by-hop ones
+            admitted = True
+        try: self.forward(px, carried, path, query, body, model, client)
+        finally:
+            if admitted: px.release()
+
+    def forward(self, px, carried, path, query, body, model, client):
+        # the same method, path, query and body; the same headers but the host, the key and the hop-by-hop ones
         heads = {}
         for k, v in self.headers.items():
             if is_hop(k) or k.lower() in ("host", "content-length", px.key_header.lower(), "authorization", "accept-encoding"): continue
@@ -1297,6 +1300,7 @@ class KeyProxy:
         self.total, self.usage, self.requests, self.refused, self.unpriced = 0.0, {}, 0, 0, set()
         self.sealed = self.closed = self.frozen = self.serving = self.walled = False
         self.on_wall, self.wall_called, self.active, self.conns, self.clients = None, False, 0, set(), set()
+        self.inflight, self.last_cost, self.wall_text = 0, None, None  # /v1/messages requests admitted and not yet booked; what the last priced response cost; why the wall is up
         self.log_file = open(log_path, "w", encoding="utf-8")
         self.server = ProxyServer(("127.0.0.1", 0), ProxyHandler)
         self.server.proxy = self
@@ -1342,12 +1346,24 @@ class KeyProxy:
         with self.cv: self.active -= 1; self.conns.discard(conn); self.cv.notify_all()
 
     def wall(self):
-        """(the refusal text, whether to call the runner's stop): the text is None while the total is under the budget; the stop is called on the first refusal only."""
+        """(the refusal text, whether to call the runner's stop): the text is None while the total is under the budget and the request is admitted, counted in flight; the stop is called on the first refusal only.
+        A request is also refused while others are in flight when the booked total plus one more response each, at the last priced response's cost, would reach the budget: the overshoot is then
+        bounded by what the responses in flight cost over that estimate, not by their whole cost. Before any response is priced there is no estimate and a first burst is admitted whole."""
         with self.lock:
-            if not self.walled: return None, False
+            if not self.walled:
+                est = self.last_cost or 0.0
+                if self.inflight and est and self.total + self.inflight * est >= self.budget - 1e-12:
+                    self.walled, self.wall_text = True, f"budget {money(self.budget)} would be reached: ${self.total:.4f} true booked and {self.inflight} in flight at about ${est:.4f} each"
+                else:
+                    self.inflight += 1
+                    return None, False
             call = self.on_wall is not None and not self.wall_called
             if call: self.wall_called = True
-            return f"budget {money(self.budget)} reached at ${self.total:.4f} true", call
+            return self.wall_text or f"budget {money(self.budget)} reached at ${self.total:.4f} true", call
+
+    def release(self):
+        """One admitted /v1/messages request is over, booked or broken: it is no longer in flight."""
+        with self.lock: self.inflight = max(0, self.inflight - 1)
 
     def log(self, path, model, status, usage, cost, client, refused):
         with self.lock:
@@ -1372,7 +1388,7 @@ class KeyProxy:
                 cost = model_cost(self.prices, model, usage) if model else None
                 if cost is None: self.unpriced.add(model or "unknown")
                 else:
-                    self.total += cost
+                    self.total += cost; self.last_cost = cost
                     if self.total >= self.budget - 1e-12: self.walled = True
             self.requests += 1
             self.write(path, model, status, usage, cost, client, None)
@@ -1788,19 +1804,12 @@ def run_cli(P, cfg, proxy):
     unmet = [w for w, bad in (("done text missing", "done" in contract and not contract["done"]["found"]), ("absent text found", "absent" in contract and contract["absent"]["found"])) if bad]
     if status == "done" and unmet: status = "finished, contract unmet: " + ", ".join(unmet)
     with open(f"{run}/result.md", "w", encoding="utf-8") as f: f.write(text)
-    out_path = None
-    if P.out_path:
-        if status == "done":
-            out_path = P.out_path
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            with open(out_path, "w", encoding="utf-8") as f: f.write(text)
-        else: notes.append(f"--out {P.out_path} not written: the run is {status}")
     tin = sum(u["in"] + u["cache_write"] + u["cache_read"] for u in st["usage"].values()); tout = sum(u["out"] for u in st["usage"].values())
     cli = st["cli_total"]
     summary = {"status": status, "run": run, "dir": d, "reads": P.reads, "readonly": P.readonly, "adapter": P.adapter, "model": P.model, "effort": P.effort, "turns": st["turns"],
                "minutes": round(mins, 1), "budget": P.budget, "cli_cost": cli, "true_cost": true, "stream_cost": stream_cost, "true_cost_is_ceiling": ceiling, "tokens_in": tin, "tokens_out": tout,
                "key_source": st["key_source"], "session_id": st["session"], "denials": st["denials"], "exit": proc.returncode, "outlived": len(walk.outlived), "cli_version": version,
-               "prices_read_on": str(cfg["prices"].get("read_on") or ""), "contract": contract, "out": out_path, "notes": notes,
+               "prices_read_on": str(cfg["prices"].get("read_on") or ""), "contract": contract, "out": None, "notes": notes,
                "proxy_cost": round(pf["cost"], 6) if pf else None, "proxy_requests": pf["requests"] if pf else None, "proxy_refused": pf["refused"] if pf else None, "network": net}
     with open(f"{run}/summary.json", "w", encoding="utf-8") as f: json.dump(summary, f, indent=1)
     clean = lambda s: re.sub(r"[|\r\n]+", "/", str(s))
@@ -1829,7 +1838,7 @@ def run_cli(P, cfg, proxy):
     total, _ = ledger_total(P.ledger_path)
     print(f"{NAME} {status} | {P.adapter} {P.label} {P.effort or '-'} | {st['turns'] or '-'} turns | {mins:.1f} min | {ccost} | {tcost} | in {tin // 1000}k out {tout // 1000}k"
           f" | paid by {st['key_source'] or '-'} | denials {len(st['denials'])} | ledger true total {money(total)} of cap {money(P.cap)}\nrun: {run}\nsession: {st['session']}"
-          + (f"\nreceipt: {receipt}" if receipt else "") + (f"\nout: {out_path}" if out_path else "") + "\n" + network_line(net), flush=True)
+          + (f"\nreceipt: {receipt}" if receipt else "") + "\n" + network_line(net), flush=True)
     if "done" in contract: print(f"done text {contract['done']['text']!r}: " + ("found" if contract["done"]["found"] else "MISSING"))
     if "absent" in contract: print(f"absent text {contract['absent']['text']!r}: " + ("FOUND" if contract["absent"]["found"] else "not in the result"))
     for t, i in st["denials"]: print(f"denied: {t} {i}")
@@ -2300,7 +2309,7 @@ def parse_args(argv):
     add("--timeout", type=int, help="seconds before the run is killed (default from config)")
     add("--soft-budget", action="store_true", help="accept a budget checked only when each turn ends, for CLIs that report usage no sooner")
     add("--name", default="run", help="slug for the run's folder and ledger line")
-    add("--out", help="write the result here when the run is done; relative to --dir, inside it")
+    add("--out", help="refused since 0.6.3: the result is in the run folder's result.md (the flag is kept so an old script gets the reason, not an unknown-argument error)")
     add("--resume", help="a session id to resume, where the adapter supports it")
     add("--done", help="text the result is expected to contain; reported, and a run without it is not 'done'")
     add("--absent", help="text the result must not contain; reported, and a run with it is not 'done'")

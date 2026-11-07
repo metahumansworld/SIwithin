@@ -621,6 +621,22 @@ def proxy_checks(whole, last_run, ledger, EH, ED, BIN, UP, pids):
     w = [post(c6, px4.token)[0], post(c6, px4.token), post(c6, px4.token)]; px4.close()
     check(w[0] == 200 and w[1][0] == 402 and w[2][0] == 402 and json.loads(w[1][2])["error"] == {"type": "billing_error", "message": "SIwithin: budget $0.0003 reached at $0.0004 true"}
           and stops == ["killed: budget $0.0003 reached at $0.0004 true"], f"proxy 15e: the wall: 402 after the budget, and the stop is called once, on the first refusal: {stops}")
+    # ---- requests in flight: one priced response, then four at once against a budget of 3.5 responses: three admitted, the fourth refused while the others are still streaming
+    stops5 = []; px5 = unit("unit-e", budget=3.5 * SONNET); px5.on_wall = stops5.append; UP.recs.clear()
+    streambody = json.dumps({"model": "claude-sonnet-5-5", "stream": True}).encode()
+    def spost(res):
+        c = http.client.HTTPConnection("127.0.0.1", px5.port, timeout=10); c.request("POST", "/v1/messages", streambody, {"x-api-key": px5.token, "content-type": "application/json"})
+        r = c.getresponse(); res.append((r.status, r.read())); c.close()
+    first = []; spost(first)
+    got = []; ths = [threading.Thread(target=spost, args=(got,)) for _ in range(4)]
+    for th in ths: th.start()
+    for th in ths: th.join(15)
+    codes5 = sorted(x[0] for x in got); refused5 = [json.loads(x[1])["error"]["message"] for x in got if x[0] == 402]
+    px5.close()
+    check(first[0][0] == 200 and codes5 == [200, 200, 200, 402] and len(UP.recs) == 4 and abs(px5.total - 4 * SONNET) < 1e-9 and px5.inflight == 0
+          and len(refused5) == 1 and refused5[0].startswith(f"SIwithin: budget ${3.5 * SONNET:.4f} would be reached: ${SONNET:.4f} true booked and 3 in flight at about ${SONNET:.4f} each")
+          and stops5 == [refused5[0][len("SIwithin: "):].join(["killed: ", ""])],
+          f"proxy 15f: of four requests in flight after one priced response, three are admitted and the fourth refused as one that would reach the budget, the stop called once: {codes5} {refused5} {stops5} total {px5.total}")
 
     # ---- the plan: the dry run, a helper in settings.json, no key, a key command, auth = env
     made = []
@@ -1044,6 +1060,9 @@ def linux_tests():
           f"linux 1: a dry run on Linux passes its checks, says the platform, and writes nothing: rc {rc}, {err.strip()[:100]!r}")
     check(t[0] == bw_ok and i > 0 and t[i + 1:i + 3] == ["/bin/sh", "-c"] and "TCP-LISTEN:<port>,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:" + siwithin.PROXY_SOCK + ' & exec "$0" "$@"' in t[i + 3] and t[i + 4:i + 6] == ["claude", "-p"],
           f"linux 2: the command is the fence program, its arguments, --, then the socat line with <port> and the CLI: {t[:1]} {t[i:i + 6]}")
+    hid = [p for p in ("/run", "/var/run") if os.path.isdir(p) and not os.path.islink(p)]
+    check(hid and all(t[t.index(p) - 1] == "--tmpfs" for p in hid) and t.index(LH) < t.index(hid[0]) < t.index(LP) and t.index("--tmpfs", t.index(hid[0])) > t.index(LP),
+          f"linux 2b: the host's runtime socket directories ({', '.join(hid)}) are hidden under a tmpfs, after the home's and before the run's folders are bound: {t[:16]}")
     prof = section(out, "fence profile", "config checks"); lines = [x for x in prof.split("\n") if x]
     check(lines[0] == siwithin.FENCE_HEAD and lines[1:12] == ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", LH] and "--unshare-net" in lines and "/tmp/siwithin-proxy.sock" in lines,
           "linux 3: the dry run prints the arguments one to a line under their first line, the tree read-only, a private /tmp, the home empty, the network unshared")
@@ -1365,7 +1384,7 @@ try:
         bud = section(out, "budget", "\0")
         N = siwithin.NAME
         rc, out, err = tool_cli(["--version"])
-        check(rc == 0 and out.strip() == "siwithin 0.6.2", f"--version prints siwithin 0.6.2: {out.strip()!r}")
+        check(rc == 0 and out.strip() == "siwithin 0.6.3", f"--version prints siwithin 0.6.3: {out.strip()!r}")
         check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
         check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
               "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -1380,13 +1399,14 @@ try:
         t = tokens(out); prof = section(out, "fence profile", "config checks")
         check(after(t, "--tools") == "Read,Grep,Glob,WebSearch,WebFetch" and "Edit" not in t, "readonly: no editing tools, no shell")
         check(f'(allow file-read* (subpath "{PROJ}"))' in prof and f'(allow file-write* (subpath "{PROJ}"))' not in prof, "readonly: nothing writable")
-        check(tool_cli(["--dir", PROJ, "--readonly", "--out", "x.md", "--dry-run"])[0] == 1, "--out with --readonly refused")
+        rc, out, err = tool_cli(["--dir", PROJ, "--readonly", "--out", "x.md", "--dry-run"])
+        check(rc == 1 and "not written since 0.6.3" in err and "result.md" in err, "--out refused, with where the result is")
         os.rename(os.path.join(FH, "cap"), os.path.join(FH, "cap.off"))
         rc, out, err = tool_cli(["--dir", PROJ, "--dry-run"])
         check(rc == 1 and "no readable cap" in out and "echo 20 >" in out, "no cap file: refused with the way to make one")
         os.rename(os.path.join(FH, "cap.off"), os.path.join(FH, "cap"))
         rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--out", "../escape.md"])
-        check(rc == 1 and "outside the run's folder" in err, "--out outside --dir refused")
+        check(rc == 1 and "not written since 0.6.3" in err and "== command ==" not in out, "--out outside --dir refused by the same refusal, before the plan is printed")
 
         group("forbidden folders")
         write(os.path.join(FH, "config.toml"), f'[never]\nfolders = ["{HOME}/work/secret"]\n')
@@ -1627,7 +1647,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
 
         def bare(line): return re.sub(r" \| receipt [0-9a-f]{64}$", "", line)  # the line as it was before the receipt field, the status last
 
-        rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--name", "first run!", "--out", "out/result.txt", "--done", "DONE-MARKER", "--absent", "TODO"])
+        rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--name", "first run!", "--done", "DONE-MARKER", "--absent", "TODO"])
         r, s = last_run()
         check(rc == 0 and s["status"] == "done", f"claude run done: rc {rc}, {s.get('status')}, {err}")
         check(abs(s["true_cost"] - 0.30) < 1e-9 and s["cli_cost"] == 0.3 and s["turns"] == 3 and s["tokens_in"] == 100000 and s["tokens_out"] == 10000, f"cost, turns, tokens in the summary: {s}")
@@ -1638,7 +1658,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
               and "network: open\n" in open(os.path.join(last_run()[0], "command.txt")).read()
               and not os.path.exists(os.path.join(E, "log-calls.txt")), f"network 13: an auth = env home with network = open: the comment in fence.sb, no read of the kernel's report, the figures say unreported: {s.get('network')}")
         check(s["contract"] == {"done": {"text": "DONE-MARKER", "found": True}, "absent": {"text": "TODO", "found": False}}, "--done found, --absent not found")
-        check(open(os.path.join(ED, "out", "result.txt")).read() == "All good. DONE-MARKER" and open(os.path.join(r, "result.md")).read() == "All good. DONE-MARKER", "--out written inside --dir, result.md written")
+        check(open(os.path.join(r, "result.md")).read() == "All good. DONE-MARKER" and not os.path.exists(os.path.join(ED, "out")) and f"\nrun: {r}\n" in out, "result.md written in the run folder, nothing in --dir, the run folder named in the summary")
         check(all(os.path.exists(os.path.join(r, f)) for f in ("brief.md", "command.txt", "events.jsonl", "stderr.txt", "result.md", "summary.json", "fence.sb")) and r.endswith("-first-run"), "the run folder holds the record")
         check(len(open(os.path.join(r, "events.jsonl")).read().strip().split("\n")) == 5, "events.jsonl holds the CLI's events")
         check(s["stream_cost"] == 0.4502, f"the summary holds what the stream priced: {s['stream_cost']}")
@@ -1652,9 +1672,9 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check("UNLISTED_VARIABLE" not in names and "ANTHROPIC_API_KEY" in names and "CLAUDE_CONFIG_DIR" in names and "CLAUDE_CODE_TMPDIR" in names, f"the run's environment is the short list: {names}")
         check(os.path.isdir(os.path.join(r, "tmp")) and os.path.isdir(os.path.join(EF, "claude-config")), "run temp root and the config directory made")
 
-        rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--done", "NOT-THERE", "--out", "second.txt"])
+        rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--done", "NOT-THERE"])
         r, s = last_run()
-        check(rc == 1 and s["status"] == "finished, contract unmet: done text missing" and not os.path.exists(os.path.join(ED, "second.txt")) and "MISSING" in out and "not written" in " ".join(s["notes"]), f"contract unmet: {s['status']}")
+        check(rc == 1 and s["status"] == "finished, contract unmet: done text missing" and "MISSING" in out, f"contract unmet: {s['status']}")
         rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--absent", "TODO"], brief="MODE:todo")
         check(rc == 1 and "absent text found" in last_run()[1]["status"] and "FOUND" in out, "--absent text found makes the run not done")
         rc, out, err = whole(["--dir", ED, "--model", "sonnet", "--budget", "0.5"], brief="MODE:clibudget")
@@ -1743,7 +1763,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.2" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.3" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
