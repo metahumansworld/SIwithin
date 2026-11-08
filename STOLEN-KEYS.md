@@ -25,19 +25,19 @@ SIwithin is the third layer, for one case: a coding agent run unattended on your
 ## What SIwithin does
 
 - The key stays with the runner, outside the fence, read by a command you name in the config. The run never holds it: the agent is given a token good for that one run, and a loopback address.
-- Every request the run makes goes through the runner's proxy on that address. The proxy meters each one at the published prices, refuses with 402 once the run's budget is reached, and logs every request to the run's folder.
+- Every request the run makes goes through the runner's proxy on that address. The proxy meters each one at the published prices, refuses with 402 once the run's budget is reached, refuses a model it has no price for, and logs every request to the run's folder; the response that crosses the budget is paid whole, and a client that goes while the headers are on their way leaves no line (SECURITY.md, "Known gaps").
 - A cap file bounds all runs together; a run that could pass the cap is refused before it starts.
 - The run leaves a ledger line and a receipt, a hash chain over the run's files with the proxy's log among them, which `--verify` checks later.
 - The fence refuses the run every socket but the proxy's loopback port (the network wall): no name lookup, no connection out. A second client inside the run reaches only the proxy, with the run's token, and is metered like the first.
 - A process the run starts and leaves behind is found and killed when the run ends.
 
-So the thing stolen at OpenCode, a raw provider key stored inside a tool, has no counterpart here; and a run that tries to spend beyond its budget, or to send anything anywhere but the API, is stopped and recorded.
+So the thing stolen at OpenCode, a raw provider key stored inside a tool, has no counterpart here; and a run that tries to spend beyond its budget, or to send anything anywhere but the API, is stopped and recorded, within the limits SECURITY.md states.
 
 ## What SIwithin does not do
 
 - It cannot protect a key you have given to someone else's server. A hosted service's copy of your key is only as safe as the service. The point of a door is that you need not give the key away.
 - It fences a run, not your machine. Malware already on the computer, outside any run, is out of scope; so is a key kept in another tool's file.
-- It watches your key's use outside its own runs only when you ask, and only as far as the provider's report goes. Spend on your provider bill that no receipt accounts for is the sign of a second user of the key; `--reconcile` (since 0.5.0) sets the provider's usage report, or the Console's usage export, against the ledger bucket by bucket and flags that spend. It has run against the live report once, on 8 November 2026, and against a fake server and the tool's own ledger in the suite; it needs an Admin API key, which an individual account is offered once it is set up as an organisation on the Console's Organization page (the documentation's step, read 24 October 2026), or the export. The provider's usage page, filtered to the key, remains the check anyone can make today.
+- It watches your key's use outside its own runs only when you ask, and only as far as the provider's report goes. Spend on your provider bill that no receipt accounts for is spend this tool did not book: a second user of the key, or a request it could not price or log, and the comparison cannot tell which; `--reconcile` (since 0.5.0) sets the provider's usage report, or the Console's usage export, against the ledger bucket by bucket and flags that spend. It has run against the live report once, on 8 November 2026, and against a fake server and the tool's own ledger in the suite; it needs an Admin API key, which an individual account is offered once it is set up as an organisation on the Console's Organization page (the documentation's step, read 24 October 2026), or the export. The provider's usage page, filtered to the key, remains the check anyone can make today.
 - macOS, by `sandbox-exec`, and Linux, by bubblewrap; it refuses to run elsewhere rather than run unfenced.
 
 ## What to do today, whichever tools you use

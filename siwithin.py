@@ -40,7 +40,7 @@ try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 BWRAP = "/usr/bin/bwrap"  # Linux's fence: absolute and a module constant, for the reasons SANDBOX_EXEC is
 SOCAT = "/usr/bin/socat"  # Linux, network = "proxy": the bridge from the run's loopback port to the key proxy's Unix socket, started inside the run's network namespace
@@ -54,6 +54,7 @@ PROXY_TAG = "SIwithin"  # the name the key proxy's error bodies carry; change it
 PRICE_STALE_DAYS = 90
 FENCE_HEAD = f"# bubblewrap arguments for {NAME}; the macOS counterpart is a sandbox-exec profile"  # the first line of fence.sb on Linux; the arguments follow, one to a line
 PROXY_SOCK = f"/tmp/{NAME}-proxy.sock"  # where the key proxy's Unix socket is bound into the run's namespace (Linux, network = "proxy")
+HIDDEN_RUNTIME = ("/run", "/var/run", "/var/tmp")  # Linux: where the host's services and programs keep Unix sockets; each that is a real directory is an empty tmpfs inside the fence (0.6.3; /var/tmp 0.6.4)
 LINUX_NET_NOTE = "Linux: the namespace has no route out, so a refused socket fails at connect (errno 101) and is not counted; no kernel report"
 
 
@@ -94,6 +95,7 @@ DEFAULT_CONFIG = {
         "cache_write_1h_factor": 1.6,  # --reconcile: a one-hour cache write over the five-minute rate above; 2.0x over 1.25x the input rate, read on 18 October 2026 at platform.claude.com/docs/en/about-claude/pricing
         "claude-haiku-5-5": [0.10, 0.125, 0.01, 0.50],
         "claude-sonnet-5-5": [2.0, 2.5, 0.10, 10.0],
+        "claude-sonnet-5": [2.0, 2.5, 0.20, 10.0],  # read 8 November 2026 at the same page; the introductory $2/$10 became standard after 31 August 2026
         "claude-opus-5-5": [4.0, 5.0, 0.20, 20.0],
         "claude-haiku-4-5-20251001": [1.0, 1.25, 0.10, 5.0],
         "gpt-5.3-codex": [1.75, 1.75, 0.175, 14.0],
@@ -292,6 +294,10 @@ def load_config(siwithin_home):
         for f, blank in BLANK_ADAPTER.items():
             if f not in ad: ad[f] = copy.deepcopy(blank)
             elif type(ad[f]) is not type(blank): raise Refused(f"config.toml: adapter {a}: {f} must be a {type(blank).__name__}")
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
+    for k, v in cfg["prices"].items():  # a nan or a negative rate would pass every comparison the budget makes; refused at the door, naming the line
+        if isinstance(v, list) and not (len(v) == 4 and all(num(x) for x in v)): raise Refused(f"config.toml: [prices] {k} must be four finite numbers, zero or above, per million tokens: [in, cache write, cache read, out]")
+        if k in ("web_search", "cache_write_1h_factor") and not num(v): raise Refused(f"config.toml: [prices] {k} must be a finite number, zero or above")
     return cfg, path, present, problems
 
 
@@ -709,7 +715,7 @@ def fence_args(c):
     a later bind over an earlier mount wins, as a later rule does in the profile. Pure: nothing is created (fence_needs says what is)."""
     home, f = c.home, c.fence
     a = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", home]  # the tree readable and not writable, a private /tmp, the home empty
-    for p in ("/run", "/var/run"):  # the host's runtime sockets (D-Bus, systemd, others) hidden: a network namespace does not stop a connect to a socket on a shared mount, a read-only mount does not either
+    for p in HIDDEN_RUNTIME:  # the host's runtime sockets (D-Bus, systemd, others) and /var/tmp hidden: a network namespace does not stop a connect to a socket on a shared mount, a read-only mount does not either
         if os.path.isdir(p) and not os.path.islink(p): a += ["--tmpfs", p]  # /var/run is a link to /run on most systems, covered by the first; the proxy's socket is bound under /tmp, not here
     for p in dict.fromkeys([os.path.join(home, r) for r in f["read_home"] + f["rc_files"]] + list(c.read_extra)): a += ["--ro-bind-try", p, p]  # allowed back out of the empty home, each if it exists, each once
     for p in [os.path.join(home, w) for w in f["write_home"]] + list(c.write_extra): a += ["--bind-try", p, p]
@@ -872,6 +878,7 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     P.model = model
     prices, factors = cfg["prices"], cfg["factors"]
     priced = model is not None and isinstance(prices.get(model), list) and len(prices[model]) == 4
+    if model is not None and not priced and ad["auth"] == "proxy": raise Refused(f"no price for {model} in [prices]: the key proxy refuses every request on a model it cannot price (since 0.6.4), so the run could not make one; add its rates to config.toml ([in, cache write, cache read, out] per million tokens) and run again")
     P.mode = "flag" if ad["budget_flag"] not in ("", UNCONFIRMED) else {"message": "stream", "turn": "turn"}.get(ad["usage_at"], "none")
     P.soft = o.soft_budget
     P.also_stream = P.mode == "flag" and ad["usage_at"] == "message"  # the CLI's flag stops the run, and so does the runner, from the usage the CLI streams
@@ -921,7 +928,7 @@ def make_plan(o, cfg, cfg_info, home, siwithin_home, brief, dry, now):
     P.network = net
     if PLATFORM == "linux" and net == "report": chk("refuse", "network: report reads the macOS kernel's log, which Linux has no counterpart of; use proxy (the wall) or open")
     elif PLATFORM == "linux" and net == "proxy" and P.proxy_on and not os.path.exists(SOCAT): chk("refuse", f"{SOCAT} not found: network = proxy bridges the run's loopback port to the key proxy with socat; install socat (apt install socat; dnf install socat), or use --network open")
-    elif PLATFORM == "linux" and net == "proxy" and P.proxy_on: chk("ok", "network: the run is in a namespace with no route out and may reach only the key proxy, by a Unix socket bound in and bridged by socat to the loopback port the CLI is given; a refused socket fails at connect and is not counted (no kernel report on Linux)")
+    elif PLATFORM == "linux" and net == "proxy" and P.proxy_on: chk("ok", "network: the run is in a namespace with no route out and reaches the API only through the key proxy, by a Unix socket bound in and bridged by socat to the loopback port the CLI is given; a refused socket fails at connect and is not counted (no kernel report on Linux); a Unix socket of a host service on a path still shared (under the read-only root outside /run, /var/run and /var/tmp, or in a folder bound in) is not stopped by the namespace")
     elif net == "proxy":
         if P.proxy_on: chk("ok", "network: the run may open only the key proxy's loopback port; every other socket, DNS included, is refused by the fence, and the refusals are counted in summary.json (network) from the kernel's report")
         else: chk("refuse", f"network: proxy ([fence] network) allows the run only the key proxy's port, and adapter {name} has auth = \"env\", which starts no proxy; "
@@ -1208,20 +1215,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if not 0 <= n <= MAX_BODY: return self.error(400 if n < 0 else 413, "invalid_request_error", "bad Content-Length" if n < 0 else "request body too large")
         body = self.rfile.read(n) if n else b""  # exactly Content-Length bytes
         if len(body) < n: self.close_connection = True; return
-        model, admitted = None, False
+        model, self.admitted = None, False
         if is_messages(path):
             try: j = json.loads(body); model = j.get("model") if isinstance(j, dict) and isinstance(j.get("model"), str) else None
             except ValueError: pass
+            if not px.priced(model):  # a response the door cannot price would be bounded by neither dollar stop: refused before it is sent, whoever in the run sends it
+                px.log(path, model, 400, None, None, client, "unpriced")
+                return self.error(400, "invalid_request_error", f"{NAME}: model {model or '(none named)'} has no price in [prices], so the budget cannot count it; add its rates to config.toml ([in, cache write, cache read, out] per million tokens) and run again", close=False)
             wall, call = px.wall()
             if wall:
                 px.log(path, model, 402, None, None, client, "budget")
                 self.error(402, "billing_error", wall, close=False)
                 if call: px.on_wall(f"killed: {wall}")  # the first refusal stops the run, once the refusal is on its way
                 return
-            admitted = True
+            self.admitted = True
         try: self.forward(px, carried, path, query, body, model, client)
         finally:
-            if admitted: px.release()
+            if self.admitted: px.release()  # not booked on any path: the 502, a failure while the headers go out, an exception
 
     def forward(self, px, carried, path, query, body, model, client):
         # the same method, path, query and body; the same headers but the host, the key and the hop-by-hop ones
@@ -1259,7 +1269,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if booked: return
             booked.append(1)
             if meter: meter.finish()
-            px.record(path, model or (meter.model if meter else None), resp.status, meter.usage if meter else None, client)
+            px.record(path, model or (meter.model if meter else None), resp.status, meter.usage if meter else None, client, self.admitted); self.admitted = False
 
         try:
             while True:
@@ -1347,13 +1357,14 @@ class KeyProxy:
 
     def wall(self):
         """(the refusal text, whether to call the runner's stop): the text is None while the total is under the budget and the request is admitted, counted in flight; the stop is called on the first refusal only.
-        A request is also refused while others are in flight when the booked total plus one more response each, at the last priced response's cost, would reach the budget: the overshoot is then
-        bounded by what the responses in flight cost over that estimate, not by their whole cost. Before any response is priced there is no estimate and a first burst is admitted whole."""
+        A request is also refused while others are in flight when the booked total plus one response each for those and for this one, at the last priced response's cost, would reach the budget: the
+        overshoot from a burst is then what its responses cost over that estimate, not their whole cost. A request with none in flight is admitted as before (the budget stops the one after it), and before
+        any response is priced there is no estimate, so a first burst is admitted whole. In flight means admitted and not yet booked: record() takes a request out under the same lock that adds its cost."""
         with self.lock:
             if not self.walled:
-                est = self.last_cost or 0.0
-                if self.inflight and est and self.total + self.inflight * est >= self.budget - 1e-12:
-                    self.walled, self.wall_text = True, f"budget {money(self.budget)} would be reached: ${self.total:.4f} true booked and {self.inflight} in flight at about ${est:.4f} each"
+                est = self.last_cost
+                if self.inflight and est is not None and self.total + (self.inflight + 1) * est >= self.budget - 1e-12:
+                    self.walled, self.wall_text = True, f"budget {money(self.budget)} would be reached: ${self.total:.4f} true booked, {self.inflight} in flight and this one at about ${est:.4f} each"
                 else:
                     self.inflight += 1
                     return None, False
@@ -1362,8 +1373,12 @@ class KeyProxy:
             return self.wall_text or f"budget {money(self.budget)} reached at ${self.total:.4f} true", call
 
     def release(self):
-        """One admitted /v1/messages request is over, booked or broken: it is no longer in flight."""
+        """One admitted /v1/messages request is over without a booking (a 502, a failure before the body, an exception): it is no longer in flight."""
         with self.lock: self.inflight = max(0, self.inflight - 1)
+
+    def priced(self, model):
+        p = self.prices.get(model) if model else None
+        return isinstance(p, list) and len(p) == 4
 
     def log(self, path, model, status, usage, cost, client, refused):
         with self.lock:
@@ -1377,10 +1392,12 @@ class KeyProxy:
                                         "cost": None if cost is None else round(cost, 6), "total": round(self.total, 6), "client": client, "refused": refused}) + "\n")
         self.log_file.flush()
 
-    def record(self, path, model, status, usage, client):
-        """One forwarded request, answered: price its usage, add it to the total under the lock, write its line."""
+    def record(self, path, model, status, usage, client, inflight=False):
+        """One forwarded request, answered: price its usage, add it to the total under the lock, write its line. An admitted /v1/messages request (inflight) leaves the in-flight count here, under the
+        same lock, so no arriving request counts it both as booked and as in flight."""
         cost = None
         with self.lock:
+            if inflight: self.inflight = max(0, self.inflight - 1)
             if self.frozen: return
             if usage is not None:
                 acc = self.usage.setdefault(model or "unknown", {"in": 0, "cache_write": 0, "cache_read": 0, "out": 0, "searches": 0})

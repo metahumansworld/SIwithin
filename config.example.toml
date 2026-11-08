@@ -45,6 +45,7 @@ web_search = 0.01        # dollars per web search request, added for any model t
 cache_write_1h_factor = 1.6   # --reconcile only: a one-hour cache write costs this times the cache-write rate below (2.0x over 1.25x the input rate, read on 2026-10-18 at platform.claude.com/docs/en/about-claude/pricing)
 "claude-haiku-5-5" = [0.10, 0.125, 0.01, 0.50]
 "claude-sonnet-5-5" = [2.0, 2.5, 0.10, 10.0]
+"claude-sonnet-5" = [2.0, 2.5, 0.20, 10.0]     # read 8 November 2026 at the same page
 "claude-opus-5-5" = [4.0, 5.0, 0.20, 20.0]
 "claude-haiku-4-5-20251001" = [1.0, 1.25, 0.10, 5.0]
 "gpt-5.3-codex" = [1.75, 1.75, 0.175, 14.0]   # no cache-write price at OpenAI, so the input rate stands in and is never used

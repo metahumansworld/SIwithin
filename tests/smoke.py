@@ -614,14 +614,18 @@ def proxy_checks(whole, last_run, ledger, EH, ED, BIN, UP, pids):
     except OSError as x: refused = type(x).__name__
     px.close()
     check(cut is not None and refused == "ConnectionRefusedError", f"proxy 15c: close() cuts a connection the run held open ({cut}) and nothing can connect after ({refused})")
-    px3 = unit("unit-c", upstream="http://127.0.0.1:1"); b = post(http.client.HTTPConnection("127.0.0.1", px3.port, timeout=10), px3.token); px3.close()
-    check(b[0] == 502 and json.loads(b[2])["error"] == {"type": "api_error", "message": "SIwithin: the upstream did not answer (ConnectionRefusedError)"} and jl(os.path.join(TMP, "unit-c.jsonl"))[0]["status"] == 502,
-          "proxy 15d: an upstream that cannot be reached: 502 in the error shape, logged")
+    px3 = unit("unit-c", upstream="http://127.0.0.1:1"); b = post(http.client.HTTPConnection("127.0.0.1", px3.port, timeout=10), px3.token)
+    for _ in range(100):  # the count is released after the 502 has gone out, in the handler's finally: a moment after the client has read it
+        if px3.inflight == 0: break
+        time.sleep(0.01)
+    in3 = px3.inflight; px3.close()
+    check(b[0] == 502 and json.loads(b[2])["error"] == {"type": "api_error", "message": "SIwithin: the upstream did not answer (ConnectionRefusedError)"} and jl(os.path.join(TMP, "unit-c.jsonl"))[0]["status"] == 502 and in3 == 0,
+          f"proxy 15d: an upstream that cannot be reached: 502 in the error shape, logged, and the request is no longer counted in flight ({in3})")
     stops = []; px4 = unit("unit-d", budget=0.0003); px4.on_wall = stops.append; c6 = http.client.HTTPConnection("127.0.0.1", px4.port, timeout=10)
     w = [post(c6, px4.token)[0], post(c6, px4.token), post(c6, px4.token)]; px4.close()
     check(w[0] == 200 and w[1][0] == 402 and w[2][0] == 402 and json.loads(w[1][2])["error"] == {"type": "billing_error", "message": "SIwithin: budget $0.0003 reached at $0.0004 true"}
           and stops == ["killed: budget $0.0003 reached at $0.0004 true"], f"proxy 15e: the wall: 402 after the budget, and the stop is called once, on the first refusal: {stops}")
-    # ---- requests in flight: one priced response, then four at once against a budget of 3.5 responses: three admitted, the fourth refused while the others are still streaming
+    # ---- requests in flight: one priced response, then four at once against a budget of 3.5 responses: two admitted (booked one, two in flight and this one at one each is 4 > 3.5 for the third), the rest refused
     stops5 = []; px5 = unit("unit-e", budget=3.5 * SONNET); px5.on_wall = stops5.append; UP.recs.clear()
     streambody = json.dumps({"model": "claude-sonnet-5-5", "stream": True}).encode()
     def spost(res):
@@ -633,10 +637,35 @@ def proxy_checks(whole, last_run, ledger, EH, ED, BIN, UP, pids):
     for th in ths: th.join(15)
     codes5 = sorted(x[0] for x in got); refused5 = [json.loads(x[1])["error"]["message"] for x in got if x[0] == 402]
     px5.close()
-    check(first[0][0] == 200 and codes5 == [200, 200, 200, 402] and len(UP.recs) == 4 and abs(px5.total - 4 * SONNET) < 1e-9 and px5.inflight == 0
-          and len(refused5) == 1 and refused5[0].startswith(f"SIwithin: budget ${3.5 * SONNET:.4f} would be reached: ${SONNET:.4f} true booked and 3 in flight at about ${SONNET:.4f} each")
+    check(first[0][0] == 200 and codes5 == [200, 200, 402, 402] and len(UP.recs) == 3 and abs(px5.total - 3 * SONNET) < 1e-9 and px5.inflight == 0 and px5.total <= 3.5 * SONNET
+          and len(refused5) == 2 and all(r.startswith(f"SIwithin: budget ${3.5 * SONNET:.4f} would be reached: ${SONNET:.4f} true booked, 2 in flight and this one at about ${SONNET:.4f} each") for r in refused5)
           and stops5 == [refused5[0][len("SIwithin: "):].join(["killed: ", ""])],
-          f"proxy 15f: of four requests in flight after one priced response, three are admitted and the fourth refused as one that would reach the budget, the stop called once: {codes5} {refused5} {stops5} total {px5.total}")
+          f"proxy 15f: of four requests at once after one priced response, two are admitted and the third refused as one that would reach the budget, the total under the budget, the stop called once: {codes5} {refused5} {stops5} total {px5.total}")
+    # ---- a booked response is out of the in-flight count the moment it is booked: with one booked and none open, a request against a budget of 1.5 responses is admitted, not walled
+    px6 = unit("unit-f", budget=1.5 * SONNET); u6 = {"in": 100, "cache_write": 0, "cache_read": 50, "out": 20, "searches": 0}
+    w1 = px6.wall(); in6a = px6.inflight; px6.record("/v1/messages", "claude-sonnet-5-5", 200, u6, "c", True); in6b, t6 = px6.inflight, px6.total
+    w2 = px6.wall(); in6c = px6.inflight; px6.release(); px6.close()
+    check(w1 == (None, False) and in6a == 1 and in6b == 0 and abs(t6 - SONNET) < 1e-12 and w2 == (None, False) and in6c == 1 and not px6.walled,
+          f"proxy 15g: record() takes a booked request out of the in-flight count under its lock, so the next request does not meet it twice: {w1} {in6a} {in6b} {w2} {in6c}")
+    # ---- a client that goes after the headers: the response is still booked and the count released
+    px7 = unit("unit-g"); UP.recs.clear()
+    c7 = http.client.HTTPConnection("127.0.0.1", px7.port, timeout=10); c7.request("POST", "/v1/messages", streambody, {"x-api-key": px7.token, "content-type": "application/json"})
+    r7 = c7.getresponse(); st7 = r7.status; c7.sock.close()  # headers read, the body never: the upstream's rest arrives 0.3 s later and the proxy's write to this socket fails
+    for _ in range(50):
+        if px7.inflight == 0 and px7.requests: break
+        time.sleep(0.1)
+    in7, req7, tot7 = px7.inflight, px7.requests, px7.total; l7 = jl(os.path.join(TMP, "unit-g.jsonl")); px7.close()
+    check(st7 == 200 and in7 == 0 and req7 == 1 and abs(tot7 - SONNET) < 1e-9 and l7 and l7[-1]["status"] == 200 and l7[-1]["refused"] is None,
+          f"proxy 15h: a client gone after the headers: what the upstream sent is booked and logged, and nothing stays in flight ({in7}, {req7}, {tot7})")
+    # ---- a model with no price is refused at the door, whoever sends it, and nothing goes upstream
+    px8 = unit("unit-h"); UP.recs.clear(); c8 = http.client.HTTPConnection("127.0.0.1", px8.port, timeout=10)
+    c8.request("POST", "/v1/messages", json.dumps({"model": "claude-mystery-9", "stream": False}).encode(), {"x-api-key": px8.token, "content-type": "application/json"}); r8 = c8.getresponse(); b8 = r8.read()
+    c8.request("POST", "/v1/messages", json.dumps({"stream": False}).encode(), {"x-api-key": px8.token, "content-type": "application/json"}); r8b = c8.getresponse(); b8b = r8b.read()
+    a8 = post(c8, px8.token); l8 = jl(os.path.join(TMP, "unit-h.jsonl")); f8 = px8.figures(); px8.close()
+    check(r8.status == 400 and json.loads(b8)["error"]["type"] == "invalid_request_error" and "model claude-mystery-9 has no price in [prices]" in json.loads(b8)["error"]["message"]
+          and r8b.status == 400 and "model (none named) has no price" in json.loads(b8b)["error"]["message"] and a8[0] == 200 and len(UP.recs) == 1
+          and [x["refused"] for x in l8] == ["unpriced", "unpriced", None] and f8["refused"] == 2 and f8["requests"] == 1 and px8.inflight == 0 and not px8.walled,
+          f"proxy 15i: a request on a model with no price, or none named, is refused 400 at the door and logged unpriced; nothing goes upstream; a priced one after it is forwarded: {r8.status} {r8b.status} {a8[0]} {[x['refused'] for x in l8]}")
 
     # ---- the plan: the dry run, a helper in settings.json, no key, a key command, auth = env
     made = []
@@ -1060,17 +1089,18 @@ def linux_tests():
           f"linux 1: a dry run on Linux passes its checks, says the platform, and writes nothing: rc {rc}, {err.strip()[:100]!r}")
     check(t[0] == bw_ok and i > 0 and t[i + 1:i + 3] == ["/bin/sh", "-c"] and "TCP-LISTEN:<port>,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:" + siwithin.PROXY_SOCK + ' & exec "$0" "$@"' in t[i + 3] and t[i + 4:i + 6] == ["claude", "-p"],
           f"linux 2: the command is the fence program, its arguments, --, then the socat line with <port> and the CLI: {t[:1]} {t[i:i + 6]}")
-    hid = [p for p in ("/run", "/var/run") if os.path.isdir(p) and not os.path.islink(p)]
-    check(hid and all(t[t.index(p) - 1] == "--tmpfs" for p in hid) and t.index(LH) < t.index(hid[0]) < t.index(LP) and t.index("--tmpfs", t.index(hid[0])) > t.index(LP),
-          f"linux 2b: the host's runtime socket directories ({', '.join(hid)}) are hidden under a tmpfs, after the home's and before the run's folders are bound: {t[:16]}")
+    hid = [p for p in siwithin.HIDDEN_RUNTIME if os.path.isdir(p) and not os.path.islink(p)]
+    check(hid and all(t[t.index(p) - 1] == "--tmpfs" and t.index(LH) < t.index(p) < t.index(LP) for p in hid) and [p for p in t if p in siwithin.HIDDEN_RUNTIME] == hid,
+          f"linux 2b: the host's runtime socket directories ({', '.join(hid)}, each that is a real directory here) are hidden under a tmpfs, after the home's and before the run's folders are bound: {t[:18]}")
     prof = section(out, "fence profile", "config checks"); lines = [x for x in prof.split("\n") if x]
     check(lines[0] == siwithin.FENCE_HEAD and lines[1:12] == ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", LH] and "--unshare-net" in lines and "/tmp/siwithin-proxy.sock" in lines,
           "linux 3: the dry run prints the arguments one to a line under their first line, the tree read-only, a private /tmp, the home empty, the network unshared")
     check(not any(x.startswith("(") or x.startswith(";") for x in lines) and "Library" not in prof and "--ro-bind-try" in lines and os.path.join(LH, ".cache") in lines and os.path.join(LH, ".zshrc") in lines
           and f"{LP}" in lines and f"{LR}" in lines and "deny_write (/opt, /usr/local, /mnt, /media, /srv) is redundant here: nothing outside the binds above is writable" in out,
           "linux 4: no sandbox-exec rule in the output, the Linux read_home and rc files bound back, both folders bound, deny_write named as redundant")
-    check("ok     network: the run is in a namespace with no route out and may reach only the key proxy, by a Unix socket bound in and bridged by socat" in out and f"network: proxy; {siwithin.LINUX_NET_NOTE}" in out,
-          "linux 5: the plan's network lines say what the namespace is and that nothing is counted")
+    check("ok     network: the run is in a namespace with no route out and reaches the API only through the key proxy, by a Unix socket bound in and bridged by socat" in out
+          and "a Unix socket of a host service on a path still shared (under the read-only root outside /run, /var/run and /var/tmp, or in a folder bound in) is not stopped by the namespace" in out and f"network: proxy; {siwithin.LINUX_NET_NOTE}" in out,
+          "linux 5: the plan's network lines say what the namespace is, what it does not stop, and that nothing is counted")
     rc, out, err = as_platform(["--dir", LP, "--dry-run", "--network", "open"]); lines = [x for x in section(out, "fence profile", "config checks").split("\n") if x]; t = tokens(out)
     check(rc == 0 and "--unshare-net" not in lines and "/tmp/siwithin-proxy.sock" not in lines and "TCP-LISTEN" not in out.split("== fence profile ==")[0] and t[t.index("--") + 1:t.index("--") + 3] == ["claude", "-p"],
           "linux 6: --network open leaves the network shared, binds no socket and starts no bridge")
@@ -1384,7 +1414,7 @@ try:
         bud = section(out, "budget", "\0")
         N = siwithin.NAME
         rc, out, err = tool_cli(["--version"])
-        check(rc == 0 and out.strip() == "siwithin 0.6.3", f"--version prints siwithin 0.6.3: {out.strip()!r}")
+        check(rc == 0 and out.strip() == "siwithin 0.6.4", f"--version prints siwithin 0.6.4: {out.strip()!r}")
         check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
         check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
               "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -1393,8 +1423,17 @@ try:
         rc, out, err = tool_cli(["--home", FH3, "--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "haiku"])
         check(after(tokens(out), "--max-budget-usd") == "140" and "(factor 40 between" in out and "2. by " + N + ", from the stream" in out, "a factor set in [factors] is honoured by the flag, and the streamed stop is still printed")
         rc, out, err = tool_cli(["--dir", PROJ, "--dry-run", "--budget", "3.5", "--model", "not-priced"])
-        check(rc == good_rc and "the streamed stop cannot price it" in out and "no price for not-priced in [prices]: this stop cannot count it, and only the CLI's flag stops the run" in out,
-              "claude with a model that has no price: allowed, and the dry run says only the flag stops it")
+        check(rc == 1 and "refused: no price for not-priced in [prices]: the key proxy refuses every request on a model it cannot price (since 0.6.4)" in err and "== command ==" not in out,
+              "claude with a model that has no price: refused with the proxy on, since the proxy would refuse its every request")
+        FH4 = os.path.join(TMP, "f41"); os.makedirs(FH4); write(os.path.join(FH4, "cap"), "100")
+        bad = []
+        for rates in ("[2.0, -2.5, 0.1, 10.0]", "[2.0, nan, 0.1, 10.0]", "[2.0, inf, 0.1, 10.0]", "[2.0, 2.5, 0.1]", "[2.0, 2.5, 0.1, true]"):
+            write(os.path.join(FH4, "config.toml"), f'[prices]\n"claude-sonnet-5-5" = {rates}\n')
+            rc, out, err = tool_cli(["--home", FH4, "--dir", PROJ, "--dry-run", "--budget", "1", "--model", "sonnet"])
+            if not (rc == 1 and "refused: config.toml: [prices] claude-sonnet-5-5 must be four finite numbers, zero or above, per million tokens" in err and "== command ==" not in out): bad.append((rates, rc, err.strip()[:120]))
+        write(os.path.join(FH4, "config.toml"), '[prices]\nweb_search = -1\n'); rc, out, err = tool_cli(["--home", FH4, "--dir", PROJ, "--dry-run", "--budget", "1", "--model", "sonnet"])
+        if not (rc == 1 and "refused: config.toml: [prices] web_search must be a finite number, zero or above" in err): bad.append(("web_search", rc, err.strip()[:120]))
+        check(not bad, f"a rate in [prices] that is negative, nan, inf, short or not a number is refused at config load, naming the line: {bad}")
         rc, out, err = tool_cli(["--dir", PROJ, "--readonly", "--read", READ, "--dry-run", "--budget", "1"])
         t = tokens(out); prof = section(out, "fence profile", "config checks")
         check(after(t, "--tools") == "Read,Grep,Glob,WebSearch,WebFetch" and "Edit" not in t, "readonly: no editing tools, no shell")
@@ -1763,7 +1802,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.3" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.4" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
