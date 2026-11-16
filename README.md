@@ -9,7 +9,7 @@ git clone https://github.com/metahumansworld/SIwithin && cd SIwithin
 python3 siwithin.py --demo
 ```
 
-The demo makes four short runs of a stand-in CLI through the real fence, the real key proxy and the real ledger, against a stand-in API on loopback at made-up prices: one run that ends `done`, one killed at its budget after the proxy refuses it, one that leaves a process behind, and one that tries to write in your home folder. It prints each run's ledger line. On Linux the last two read differently and the demo says why: the run's process namespace ends with the CLI, and the home the run sees is an empty stand-in.
+The demo makes four short runs of a stand-in CLI through the real fence, the real key proxy and the real ledger, against a stand-in API on loopback at made-up prices: one run that ends `done`, one killed at its budget after the proxy refuses it, one that leaves a process behind, and one that tries to write in your home folder. It prints each run's ledger line, with the folder and the receipt shortened. On Linux the last two read differently and the demo says why: the run's process namespace ends with the CLI, and the home the run sees is an empty stand-in.
 
 **With a key**, on a brief of your own:
 
@@ -170,7 +170,7 @@ After a run ends, and before its ledger line is appended, the runner writes `rec
 
 `receipt.json` is JSON with sorted keys, indent 1, UTF-8; its hash is the sha256 of its bytes. Fields:
 
-- `receipt`: the format's version, 1. `tool`: the runner's name and version, `siwithin 0.6.5`. `run`: the run folder's name, as on the ledger line after `runs/`.
+- `receipt`: the format's version, 1. `tool`: the runner's name and version, `siwithin 0.6.6`. `run`: the run folder's name, as on the ledger line after `runs/`.
 - `started` and `ended`: the run's start and the moment the receipt was written, ISO 8601 to the second. `status`: as on the ledger line.
 - `files`: the sha256 of `brief.md`, `command.txt`, `fence.sb`, `events.jsonl`, `stderr.txt`, `result.md` and `summary.json`, and of `proxy.jsonl` on a run that had a proxy. Nothing else from the folder: not `tmp/`.
 - `ledger_before`: the sha256 of the ledger's bytes immediately before this run's line was appended (with the header already written when the ledger was new).
@@ -250,6 +250,8 @@ Built from public documentation, read on **2026-10-13**:
 Copy `config.example.toml` to `~/.config/siwithin/config.toml`. Every option is there with a one-line comment, and every value is the built-in default, so keep only what you change; `[auth]` holds `key_command`, `upstream`, `upstream_timeout` and `paths`; `[fence] network` picks the run's network, `proxy`, `report` or `open`; `[reconcile]` holds `admin_key_command`, `api_key_ids` and `tolerance`, and `[prices] cache_write_1h_factor` the one-hour cache write's ratio (Reconcile). `--home <folder>` moves all of SIwithin's paths (`config.toml`, `cap`, `ledger.md`, `lock`, `runs/`, the per-CLI config directories) in one go.
 
 ## Status
+
+Version 0.6.6, released 16 November 2026: the demo shows each ledger line with its folder and receipt shortened; nothing else changes; `--version` prints `siwithin 0.6.6` (CHANGELOG).
 
 Version 0.6.5, released 16 November 2026: `--demo`, four short runs with no key and no money, through the real fence, proxy and ledger against a stand-in API on loopback, and a first screen for this page that says what the tool is, what is not tested and who wrote it; `--version` prints `siwithin 0.6.5` (CHANGELOG). Nothing in a real run's path changes: the last steps of a run moved, unchanged, into one function that a run and the demo both call.
 

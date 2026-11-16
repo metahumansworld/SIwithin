@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.6, 2026-11-16
+
+- 2026-11-16: `--version` prints `siwithin 0.6.6`; the smoke test passes 493 checks on macOS and 266 on Linux with fake CLIs, the red fake pass 92 on both.
+- `--demo` shows each run's ledger line with the demo's work folder as `<demo>/work` and the receipt cut to twelve characters, and says so; the ledger it names holds the whole lines. In 0.6.5 a temporary path and a 64-character receipt filled each line. Nothing in a run changes.
+
 ## v0.6.5, 2026-11-16
 
 - 2026-11-16: `--version` prints `siwithin 0.6.5`; the smoke test passes 493 checks on macOS and 266 on Linux with fake CLIs, the red fake pass 92 on both.
