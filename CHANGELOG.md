@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.5, 2026-11-16
+
+- 2026-11-16: `--version` prints `siwithin 0.6.5`; the smoke test passes 493 checks on macOS and 266 on Linux with fake CLIs, the red fake pass 92 on both.
+- `--demo`: four short runs with no key and no money. A stand-in CLI, written into the demo's own folder, runs through the same path as any run: the real fence (`sandbox-exec` or bubblewrap), the real key proxy with its budget wall, the walk at the end and the ledger writer. The API is a stand-in the demo starts on loopback, priced at made-up rates held in the demo's own configuration. The demo reads no `config.toml`, no key variable and no key command, uses a home, cap and ledger of its own under a temporary folder, and refuses, as a run would, where the fence cannot be set up. It shows a run that ends `done`, a run killed at its budget after a 402, a process left behind, and a write to the home folder. On Linux the left-behind process is gone with the run's process namespace before the walk looks, and the write lands in the empty stand-in home and is gone with it; the demo says so in place of the macOS lines. `--demo` goes alone: with `--dir`, `--home`, `--verify` or `--reconcile` it is refused.
+- The last steps of a run (the plan's refusals, the home's folders, the lock, the plan again under the lock, the run) moved unchanged out of `main` into one function, which a run and the demo both call.
+- README: a first screen under the title in place of the opening paragraph: what it is, the demo, four commands, the line a run leaves, where the key is, what is not tested or not done, and who wrote it. An AI model wrote the code and its tests, directed and reviewed by the maintainer; no person outside the project has reviewed the code for security yet.
+- Not tested: the demo on a machine other than the maintainer's Mac and one Ubuntu 24.04 VM, with a Python kept under the home folder, or on Python 3.10.
+
 ## v0.6.4, 2026-11-09
 
 - 2026-11-09: the second outside review, by Codex (gpt-6-astra) on a checkout of the 0.6.3 public tree, read against the code by the maintainer; its findings on the three 0.6.3 fixes and on the documents are taken here. `--version` prints `siwithin 0.6.4`; the smoke test passes 479 checks on macOS and 252 on Linux with fake CLIs, the red fake pass 92 on both.

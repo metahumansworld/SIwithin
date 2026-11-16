@@ -33,14 +33,14 @@ Findings from the launcher this grew out of, each made on a real CLI and kept be
 """
 from __future__ import annotations
 
-import argparse, copy, csv, datetime, hashlib, http.client, http.server, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, socketserver, ssl, subprocess, sys, threading, time, urllib.parse
+import argparse, contextlib, copy, csv, datetime, hashlib, http.client, http.server, io, json, math, os, queue, re, secrets, shlex, shutil, signal, socket, socketserver, ssl, subprocess, sys, tempfile, threading, time, urllib.parse
 from types import SimpleNamespace
 
 try: import tomllib  # Python 3.11+; the reader below covers 3.10
 except ImportError: tomllib = None
 
 NAME = "siwithin"  # the one constant to change when the tool is renamed: default home, messages, ledger header, lock text
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # absolute, so a PATH entry cannot stand in for the fence; a module constant, not an environment switch
 BWRAP = "/usr/bin/bwrap"  # Linux's fence: absolute and a module constant, for the reasons SANDBOX_EXEC is
 SOCAT = "/usr/bin/socat"  # Linux, network = "proxy": the bridge from the run's loopback port to the key proxy's Unix socket, started inside the run's network namespace
@@ -2304,6 +2304,138 @@ def reconcile_command(o, home):
         return 2
 
 
+def launch(o, cfg, cfg_info, home, siwithin_home, brief, P):
+    """A real run from a plan already made: the plan's refusals, the home's folders, the lock, the plan again under the lock, the run. A run's one way in, the demo's runs included."""
+    bad = [t for lv, t in P.checks if lv == "refuse"]
+    if bad: raise Refused("; ".join(bad))
+    os.makedirs(siwithin_home, mode=0o700, exist_ok=True)  # private: it holds briefs, events and the ledger
+    os.makedirs(os.path.join(siwithin_home, "runs"), mode=0o700, exist_ok=True)
+    lock = acquire_lock(os.path.join(siwithin_home, "lock"))
+    # the plan is made again under the lock: the ledger and the run's folder name may have changed while another run held it
+    P = make_plan(o, cfg, cfg_info, home, siwithin_home, brief, False, datetime.datetime.now())
+    bad = [t for lv, t in P.checks if lv == "refuse"]
+    if bad: raise Refused("; ".join(bad))
+    lock.seek(0); lock.truncate(); lock.write(f"pid {os.getpid()} runs/{os.path.basename(P.run)} since {P.stamp}\n"); lock.flush()
+    return execute(P, cfg)
+
+
+# ---- the demo: four short runs through the run path above, with no key and no money; only the API and the CLI are stand-ins --------------
+
+DEMO_MODEL, DEMO_PRICE, DEMO_BUDGET = f"{NAME}-demo-model", [1.0, 1.25, 0.10, 5.0], 0.02  # in the demo's own config, not in the public price table; one stand-in response costs $0.007 at these rates
+DEMO_KEY = "demo-key-that-opens-nothing"  # what the proxy holds in the real key's place and sends to the stand-in API on loopback, and nowhere else
+# The stand-in CLI: it speaks the claude adapter's event shape, asks the API at the address and with the token the run was given, and does what the first word of its brief says.
+DEMO_CLI = r"""
+import json, os, subprocess, sys, time, urllib.error, urllib.request
+if sys.argv[1:] == ["--version"]: print("demo-cli 1.0.0"); sys.exit(0)
+brief = sys.stdin.read().split()
+mode, used = brief[0], {"inputTokens": 0, "outputTokens": 0}
+def ev(o): print(json.dumps(o), flush=True)
+def ask():
+    req = urllib.request.Request(os.environ["DEMO_BASE_URL"] + "/v1/messages", method="POST", headers={"x-api-key": os.environ["DEMO_API_KEY"], "content-type": "application/json"},
+                                 data=json.dumps({"model": "@MODEL@", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}).encode())
+    try: u = json.load(urllib.request.urlopen(req, timeout=10))["usage"]
+    except urllib.error.HTTPError as e: return e.code
+    used["inputTokens"] += u["input_tokens"]; used["outputTokens"] += u["output_tokens"]
+    return 200
+ev({"type": "system", "subtype": "init", "apiKeySource": "DEMO_API_KEY", "session_id": "demo-" + mode})
+if mode == "finish":
+    ask()
+    with open("made-by-the-run.txt", "w") as f: f.write("written by the stand-in CLI, inside the run's folder\n")
+    text = "DEMO-OK: one request made, one file written in the run's folder"
+elif mode == "spend":  # asks until it is refused; the runner kills it at the first refusal, so the wait below is never finished
+    while ask() == 200: pass
+    time.sleep(25); text = "refused by the proxy"
+elif mode == "leave":  # a process in a session of its own, with none of the runner's pipes: it would live on after this program ends
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ask(); text = f"left process {p.pid} asleep for two minutes and ended"
+else:  # reach: a file in the home folder, outside the run's folder
+    target = os.path.join(os.path.expanduser("~"), brief[1])
+    try:
+        with open(target, "w") as f: f.write("x")
+        text = f"no error: wrote {target}"
+    except OSError as e: text = f"{type(e).__name__}: {e}"
+ev({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "result": text, "session_id": "demo-" + mode, "permission_denials": [], "modelUsage": {"@MODEL@": used}})
+"""
+
+
+class DemoUpstream(http.server.BaseHTTPRequestHandler):
+    """The stand-in API: every POST gets one message in the shape the proxy prices, 2000 tokens in and 1000 out."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a): pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        out = json.dumps({"id": "msg_demo", "type": "message", "role": "assistant", "model": DEMO_MODEL, "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 2000, "output_tokens": 1000}}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+
+
+def demo(home):
+    """--demo: four runs of a stand-in CLI through launch(), each inside the real fence and behind the real key proxy, booked by the real ledger writer in a home of the demo's own under a temp
+    folder. The API is a stand-in on loopback and the proxy's key is DEMO_KEY, so no config.toml, key variable or key command is read and nothing is spent. A refusal is a run's own refusal."""
+    base = real(tempfile.mkdtemp(prefix=f"{NAME}-demo-")); dh, work = os.path.join(base, "home"), os.path.join(base, "work"); cli, ledger = os.path.join(work, "demo-cli.py"), os.path.join(dh, "ledger.md")
+    os.makedirs(dh, mode=0o700); os.makedirs(work)
+    with open(os.path.join(dh, "cap"), "w", encoding="utf-8") as f: f.write("1\n")
+    with open(cli, "w", encoding="utf-8") as f: f.write(DEMO_CLI.replace("@MODEL@", DEMO_MODEL))
+    up = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DemoUpstream); up.daemon_threads = True
+    threading.Thread(target=up.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    if PLATFORM == "linux": cfg["fence"].update(copy.deepcopy(LINUX_FENCE))
+    cfg["defaults"]["adapter"], cfg["prices"][DEMO_MODEL] = "demo", list(DEMO_PRICE)
+    cfg["auth"].update(key_command="", upstream=f"http://127.0.0.1:{up.server_address[1]}", upstream_timeout=10, paths=["/v1/messages"])
+    cfg["adapters"] = {"demo": dict(copy.deepcopy(BLANK_ADAPTER), bin=sys.executable, config_dir="{fence_home}/demo-config", config_dir_env="DEMO_CONFIG_DIR", tmp_env="DEMO_TMPDIR", auth="proxy",
+                                    key_env="DEMO_API_KEY", base_url_env="DEMO_BASE_URL", key_header="x-api-key", output="claude-stream-json", usage_at="message", brief="stdin", model_flag="--model",
+                                    read_home=sorted({os.path.relpath(p, home) for p in (real(sys.prefix), real(sys.base_prefix)) if under(p, home) and p != home}),  # a Python kept in the home is read from there
+                                    args=[cli], version_args=[cli, "--version"], require_api_key=True, measured=["1.0.0"])}
+    info, pr = (os.path.join(dh, "config.toml"), False, []), lambda t: print(t, flush=True)
+    held = os.environ.get("DEMO_API_KEY")
+    os.environ["DEMO_API_KEY"] = DEMO_KEY  # the demo adapter's key variable, as the runner reads it: a name of the demo's own, so the real key's variable is never looked at
+
+    def run(n, say, slug, brief, *extra):
+        pr(f"\n{n}. {say}")
+        o = parse_args(["--dir", work, "--model", DEMO_MODEL, "--budget", str(DEMO_BUDGET), "--timeout", "30", "--name", slug] + list(extra))
+        with contextlib.redirect_stdout(io.StringIO()):  # the run's own report is in its folder; the demo prints the ledger line and what it names
+            launch(o, cfg, info, home, dh, brief, make_plan(o, cfg, info, home, dh, brief, False, datetime.datetime.now()))
+        with open(ledger, encoding="utf-8") as f: line = f.read().splitlines()[-1]
+        folder = os.path.join(dh, [x for x in line.split(" | ") if x.startswith("runs/")][0])
+        with open(os.path.join(folder, "summary.json"), encoding="utf-8") as f: s = json.load(f)
+        pr("   " + line)
+        return s, folder
+
+    try:
+        pr(f"{NAME} {VERSION} demo: four short runs of a stand-in CLI inside the real fence ({'bubblewrap' if PLATFORM == 'linux' else 'sandbox-exec'}), behind the real key proxy. "
+           f"The API is a stand-in on 127.0.0.1:{up.server_address[1]}, priced at made-up rates: no key is read and nothing is spent.")
+        s, _ = run(1, f'A run that finishes: the CLI asks the API once, writes a file in its folder and ends with the text the brief\'s test looks for (--done "DEMO-OK").', "demo-done", "finish\n", "--done", "DEMO-OK")
+        ok = [s["status"] == "done" and s["contract"]["done"]["found"]]
+        pr(f"   done text 'DEMO-OK': {'found' if s['contract']['done']['found'] else 'MISSING'}; the proxy booked {s['proxy_requests']} request, ${s['proxy_cost']:.4f}")
+        s, folder = run(2, f"A run that keeps asking the API on a budget of {money(DEMO_BUDGET)}: the proxy prices each response and refuses the first request after the budget is reached.", "demo-budget", "spend\n")
+        with open(os.path.join(folder, PROXY_LOG), encoding="utf-8") as f: wall = [r for r in map(json.loads, f) if r["refused"] == "budget"]
+        ok.append(s["status"].startswith("killed: budget") and bool(wall))
+        pr(f"   the proxy booked {s['proxy_requests']} requests, ${s['proxy_cost']:.4f}, and answered the next with {wall[0]['status'] if wall else 'no refusal'} ({PROXY_LOG}: refused {s['proxy_refused']}); the run was killed there")
+        s, _ = run(3, "A run that leaves a process behind: the CLI starts one in a session of its own and ends; the walk at the run's end looks for what the run started, kills it and counts it.", "demo-leftover", "leave\n")
+        ok.append(s["status"] == "done" and (s["outlived"] == 1 or PLATFORM == "linux"))
+        pr(f"   summary.json: outlived {s['outlived']}; " + ("the process was killed by the walk" if s["outlived"] else "the run's process namespace ended with the CLI and took the process with it before the walk looked"))
+        name = f"{NAME}-demo-{secrets.token_hex(4)}.txt"; target = os.path.join(home, name)
+        s, folder = run(4, f"A run that tries to write {target}, in your home folder and outside the folder it was given.", "demo-home", f"reach {name}\n")
+        with open(os.path.join(folder, "result.md"), encoding="utf-8") as f: said = f.read().strip()
+        landed = os.path.lexists(target)
+        ok.append(s["status"] == "done" and not landed and (PLATFORM == "linux" or "Error" in said))
+        pr(f"   the CLI reported: {said}\n   " + (f"THE FILE IS THERE: the fence did not hold; remove {target}" if landed else "outside the fence that file does not exist"
+           + ("" if "Error" in said else ": on Linux the home the run sees is a stand-in holding only what the fence lets back in, and what is written there goes with it")))
+        pr(f"\nledger: {ledger} (each run's folder is beside it, under runs/)\n"
+           f"nothing was sent off this machine and no key was read: the one upstream was the demo's own, on 127.0.0.1:{up.server_address[1]}\n"
+           f'for real: python3 {NAME}.py --dir ~/work/proj --model sonnet --budget 2 --done "ALL TESTS PASS" < brief.md   (README.md, Quick start)')
+        if not all(ok): pr("the demo did not show what it says above in run " + ", ".join(str(i + 1) for i, v in enumerate(ok) if not v))
+        return 0 if all(ok) else 1
+    except Refused:
+        if not os.path.exists(ledger): shutil.rmtree(base, ignore_errors=True)  # refused before any run: nothing to keep
+        raise
+    finally:
+        up.shutdown(); up.server_close()
+        if held is None: os.environ.pop("DEMO_API_KEY", None)
+        else: os.environ["DEMO_API_KEY"] = held
+
+
 def parse_args(argv):
     a = argparse.ArgumentParser(prog=NAME, description="Run an agent CLI headless on a brief (stdin), inside a folder fence, under a dollar budget and a cap.")
     add = a.add_argument
@@ -2333,11 +2465,13 @@ def parse_args(argv):
     add("--require-api-key", action=argparse.BooleanOptionalAction, default=None, help="check the CLI bills an API key and not a login (default on for claude)")
     add("--home", help=f"the tool's home: config.toml, cap, ledger.md, lock, runs/ (default ~/.config/{NAME})")
     add("--dry-run", action="store_true", help="print the command, the fence, the checks and the budget arithmetic; run nothing")
+    add("--demo", action="store_true", help="four short runs of a stand-in CLI inside the real fence, behind the real key proxy, against a stand-in API on loopback: no key is read, nothing is spent; it goes alone")
     add("--version", action="version", version=f"{NAME} {VERSION}")
     o = a.parse_args(argv)
+    if o.demo and (o.dir or o.verify or o.reconcile is not None or o.home): a.error("--demo goes alone: it makes its own folders and takes no --dir, --home, --verify or --reconcile")
     if o.reconcile is not None and (o.dir or o.verify): a.error("--reconcile reads records and runs nothing: it takes no --dir and no --verify")
     if o.reconcile is None and any(x is not None for x in (o.until, o.bucket, o.csv, o.every)): a.error("--until, --bucket, --csv and --every go with --reconcile")
-    if not o.dir and not o.verify and o.reconcile is None: a.error("--dir is required")
+    if not o.dir and not o.verify and o.reconcile is None and not o.demo: a.error("--dir is required")
     if o.expect is not None and o.verify is not True: a.error("--expect goes with --verify alone: it checks the ledger's last receipt, not a run folder")
     return o
 
@@ -2347,6 +2481,7 @@ def main(argv=None):
         o = parse_args(argv)
         if PLATFORM == "win32": raise Refused(f"{NAME} needs macOS sandbox-exec and refuses to run on Windows rather than run without a fence; see {ROADMAP}")
         home = derive_home()
+        if o.demo: return demo(home)  # its own home, cap and ledger under a temp folder: no config.toml, no key
         siwithin_home = real(o.home) if o.home else os.path.join(home, ".config", NAME)
         if o.verify: return verify_ledger(siwithin_home, o.expect) if o.verify is True else verify_folder(o.verify)  # no lock, no config
         if o.reconcile is not None: return reconcile_command(o, siwithin_home)  # no lock, no fence, no ledger line: a reading of records
@@ -2357,17 +2492,7 @@ def main(argv=None):
         if o.dry_run:
             show_plan(P)
             return 1 if any(lv == "refuse" for lv, _ in P.checks) else 0
-        bad = [t for lv, t in P.checks if lv == "refuse"]
-        if bad: raise Refused("; ".join(bad))
-        os.makedirs(siwithin_home, mode=0o700, exist_ok=True)  # private: it holds briefs, events and the ledger
-        os.makedirs(os.path.join(siwithin_home, "runs"), mode=0o700, exist_ok=True)
-        lock = acquire_lock(os.path.join(siwithin_home, "lock"))
-        # the plan is made again under the lock: the ledger and the run's folder name may have changed while another run held it
-        P = make_plan(o, cfg, (cfg_path, present, problems), home, siwithin_home, brief, False, datetime.datetime.now())
-        bad = [t for lv, t in P.checks if lv == "refuse"]
-        if bad: raise Refused("; ".join(bad))
-        lock.seek(0); lock.truncate(); lock.write(f"pid {os.getpid()} runs/{os.path.basename(P.run)} since {P.stamp}\n"); lock.flush()
-        return execute(P, cfg)
+        return launch(o, cfg, (cfg_path, present, problems), home, siwithin_home, brief, P)
     except Refused as x:
         print(f"refused: {x}", file=sys.stderr, flush=True)
         return 1

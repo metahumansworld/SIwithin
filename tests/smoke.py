@@ -1342,6 +1342,58 @@ def linux_real_tests():
     UP.shutdown(); UP.server_close()
 
 
+
+# ---- the demo: python3 siwithin.py --demo as a stranger runs it, a subprocess on the real platform, inside the real fence -------------------------------------------------------------
+
+def demo_tests():
+    group("the demo: --demo, no key, the real fence")
+    for extra in (["--dir", PROJ], ["--home", os.path.join(TMP_ROOT, "no-such-home")], ["--verify"], ["--reconcile", "2026-10-16"]):
+        rc, out, err = tool_cli(["--demo"] + extra)
+        check(rc == 2 and err.strip().split("\n")[-1].endswith("--demo goes alone: it makes its own folders and takes no --dir, --home, --verify or --reconcile") and not out, f"demo 0: --demo with {extra[0]} is refused in one line: {err.strip()[-90:]!r}")
+    DT = os.path.join(TMP_ROOT, "demo-tmp"); os.makedirs(DT)
+    env = dict(ENV, TMPDIR=DT)  # no ANTHROPIC_API_KEY, a throwaway HOME, and the demo's own folders under the suite's
+
+    def tree(top): return {os.path.join(d, n): (os.lstat(os.path.join(d, n)).st_size, os.lstat(os.path.join(d, n)).st_mtime_ns) for d, ds, fs in os.walk(top) for n in ds + fs}
+
+    def go(env):
+        t0 = time.time(); r = subprocess.run([sys.executable, os.path.join(ROOT, "siwithin.py"), "--demo"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=150)
+        return r.returncode, r.stdout, r.stderr, time.time() - t0
+    before = tree(HOME); rc, out, err, took = go(env)
+    why = None if DARWIN else "not macOS or Linux" if not LINUX else f"{siwithin.BWRAP} not found" if not os.path.exists(siwithin.BWRAP) else siwithin.bwrap_preflight() or (None if os.path.exists(siwithin.SOCAT) else f"{siwithin.SOCAT} not found")
+    if why:  # no fence to be had here: the demo refuses as a run does, and runs nothing
+        check(rc == 1 and err.startswith("refused: ") and len(err.strip().split("\n")) == 1 and " | " not in out and tree(HOME) == before and not os.listdir(DT),
+              f"demo 1: where the fence cannot be set up ({why[:60]}) the demo refuses in one line, books nothing and leaves no folder: rc {rc}, {err.strip()[:120]!r}")
+        return
+    m = re.search(r"^ledger: (\S+/home/ledger\.md) ", out, re.M); led = open(m.group(1)).read().strip().split("\n") if m else []
+    lines = [l.strip() for l in out.split("\n") if re.match(r"\s+\d{4}-\d\d-\d\d \d\d:\d\d \| demo-", l)]
+    check(rc == 0 and not err and took < 60, f"demo 1: --demo exits 0 with ANTHROPIC_API_KEY unset, nothing on stderr, in {took:.1f}s (under 60): rc {rc}, {err.strip()[:200]!r}")
+    status = [l.split(" | ")[-2] for l in lines]
+    check(status == ["done", "killed: budget $0.02 reached at $0.0210 true", "done", "done"] and [l.split(" | ")[1] for l in lines] == ["demo-done", "demo-budget", "demo-leftover", "demo-home"],
+          f"demo 2: the output holds four ledger lines: done, killed at the budget, done, done: {status}")
+    check(led[1:] == lines and led[0].startswith(f"# {siwithin.NAME} ledger") and siwithin.ledger_total(m.group(1)) == (0.035, 4) if m else False, f"demo 3: the demo's ledger holds those four lines and no other, $0.0350 in all: {len(led)} lines")
+    rc2, out2, _ = tool_cli(["--verify", "--home", os.path.dirname(m.group(1))]) if m else (1, "", "")
+    check(rc2 == 0, f"demo 4: --verify passes on the demo's ledger and receipts: {out2.strip()[-80:]!r}")
+    check("done text 'DEMO-OK': found; the proxy booked 1 request, $0.0070" in out and "booked 3 requests, $0.0210, and answered the next with 402 (proxy.jsonl: refused 1)" in out,
+          "demo 5: the done text is found on a priced request, and the budget run shows three requests booked and the fourth answered 402")
+    check("summary.json: outlived 1; the process was killed by the walk" in out if DARWIN else "summary.json: outlived " in out, "demo 6: the leftover process is on record" + (", killed by the walk and counted" if DARWIN else " (the count is the namespace's to race on Linux)"))
+    t = re.search(r"tries to write (\S+), in your home", out); said = out.split("the CLI reported: ", 1)[-1].split("\n")[0]
+    check(bool(t) and os.path.dirname(t.group(1)) == os.path.realpath(HOME) and not os.path.lexists(t.group(1)) and "outside the fence that file does not exist" in out
+          and (said.startswith("PermissionError: [Errno 1]") if DARWIN else said.startswith(("no error: wrote ", "PermissionError", "OSError"))), f"demo 7: the write into the home folder did not land, and the CLI's own report is printed: {said[:90]!r}")
+    check(tree(HOME) == before and os.path.join(FH, "cap") in before, f"demo 8: the home, the tool's real config home in it included, is as it was: {sorted(set(tree(HOME)) ^ set(before))[:3]}")
+    tail = out.strip().split("\n")[-3:]
+    check(len(tail) == 3 and tail[0].startswith("ledger: ") and tail[1].startswith("nothing was sent off this machine and no key was read") and tail[2].startswith(f"for real: python3 {siwithin.NAME}.py --dir ") and '--done "ALL TESTS PASS" < brief.md' in tail[2]
+          and tail[2].split("for real: ")[1].split("   ")[0] in open(os.path.join(ROOT, "README.md")).read().replace(" \\\n    ", " "), f"demo 9: the last three lines: the ledger, nothing sent and no key read, the README's quick-start command: {tail[2][:80]!r}")
+    # a key in the stranger's environment changes nothing and goes nowhere
+    rc, out3, err, took = go(dict(env, ANTHROPIC_API_KEY=TESTKEY))
+    m3 = re.search(r"^ledger: (\S+)/home/ledger\.md ", out3, re.M); hits = []
+    for d, ds, fs in os.walk(m3.group(1) if m3 else DT):
+        for n in fs:
+            with open(os.path.join(d, n), "rb") as f:
+                if TESTKEY.encode() in f.read(): hits.append(n)
+    shape = lambda o: re.sub(r"\d{4}-\d\d-\d\d[ -]\d\d:?\d\d|receipt [0-9a-f]{64}|siwithin-demo-[a-z0-9_]{8}|127\.0\.0\.1:\d+|\d\.\d min", "~", o)
+    check(rc == 0 and not err and m3 and not hits and shape(out3) == shape(out), f"demo 10: with ANTHROPIC_API_KEY set the demo prints the same, and the key is in no file the demo or its runs wrote: rc {rc}, hits {hits}")
+
+
 try:
     # ---------------------------------------------------------------- part 1: dry runs
     write(os.path.join(FH, "cap"), "10\n")
@@ -1414,7 +1466,7 @@ try:
         bud = section(out, "budget", "\0")
         N = siwithin.NAME
         rc, out, err = tool_cli(["--version"])
-        check(rc == 0 and out.strip() == "siwithin 0.6.4", f"--version prints siwithin 0.6.4: {out.strip()!r}")
+        check(rc == 0 and out.strip() == "siwithin 0.6.5", f"--version prints siwithin 0.6.5: {out.strip()!r}")
         check("enforced twice:" in bud and f"1. by the CLI: --max-budget-usd 3.5 (factor 1 between" in bud, "dry run, enforcement 1: the CLI's flag with its factor")
         check(f"2. by {N}, from the stream" in bud and "once per message id" in bud and 'killed: budget $3.50 reached at $<true> true' in bud and "output tokens are a placeholder" in bud,
               "dry run, enforcement 2: the streamed true-cost stop, its message and its limit")
@@ -1802,7 +1854,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
         check(all(sorted(r["files"]) == sorted(siwithin.RECEIPT_FILES) and len(r["files"]) == 7 and all(sha(os.path.join(EF, "runs", n, f)) == r["files"][f] for f in r["files"])
                   for r, (_, n) in zip(recs, carried)), "files holds exactly the seven names, and each hash matches the file on disk")
         r0 = recs[0]
-        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.4" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
+        check(r0["receipt"] == 1 and r0["tool"] == "siwithin 0.6.5" and r0["run"] == carried[0][1] and r0["status"] == "done" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["started"]) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r0["ended"])
               and r0["started"] <= r0["ended"] and re.fullmatch(r"[0-9a-f]{64}", r0["ledger_before"]) and sorted(r0) == ["ended", "files", "ledger_before", "previous", "receipt", "run", "started", "status", "tool"],
               f"the first receipt's fields: {r0}")
         raw0 = open(os.path.join(EF, "runs", carried[0][1], "receipt.json"), "rb").read()
@@ -1939,6 +1991,7 @@ if "MODE:twoturns" in brief: ev({{"type": "turn.started"}}); time.sleep(60)
     try: reconcile_tests()
     finally: show[0] = False
     linux_real_tests()
+    demo_tests()
 finally:
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
 
