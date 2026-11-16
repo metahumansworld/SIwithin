@@ -2370,6 +2370,11 @@ class DemoUpstream(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
 
 
+def demo_short(line, work):
+    """A ledger line as the demo shows it: the demo's work folder and the receipt shortened; the ledger holds the whole line."""
+    return re.sub(r"receipt ([0-9a-f]{12})[0-9a-f]+$", r"receipt \1...", line.replace(work, "<demo>/work"))
+
+
 def demo(home):
     """--demo: four runs of a stand-in CLI through launch(), each inside the real fence and behind the real key proxy, booked by the real ledger writer in a home of the demo's own under a temp
     folder. The API is a stand-in on loopback and the proxy's key is DEMO_KEY, so no config.toml, key variable or key command is read and nothing is spent. A refusal is a run's own refusal."""
@@ -2399,12 +2404,13 @@ def demo(home):
         with open(ledger, encoding="utf-8") as f: line = f.read().splitlines()[-1]
         folder = os.path.join(dh, [x for x in line.split(" | ") if x.startswith("runs/")][0])
         with open(os.path.join(folder, "summary.json"), encoding="utf-8") as f: s = json.load(f)
-        pr("   " + line)
+        pr("   " + demo_short(line, work))
         return s, folder
 
     try:
         pr(f"{NAME} {VERSION} demo: four short runs of a stand-in CLI inside the real fence ({'bubblewrap' if PLATFORM == 'linux' else 'sandbox-exec'}), behind the real key proxy. "
-           f"The API is a stand-in on 127.0.0.1:{up.server_address[1]}, priced at made-up rates: no key is read and nothing is spent.")
+           f"The API is a stand-in on 127.0.0.1:{up.server_address[1]}, priced at made-up rates: no key is read and nothing is spent.\n"
+           f"Under each run is its ledger line, with the folder and the receipt shortened; the whole lines are in the ledger named at the end.")
         s, _ = run(1, f'A run that finishes: the CLI asks the API once, writes a file in its folder and ends with the text the brief\'s test looks for (--done "DEMO-OK").', "demo-done", "finish\n", "--done", "DEMO-OK")
         ok = [s["status"] == "done" and s["contract"]["done"]["found"]]
         pr(f"   done text 'DEMO-OK': {'found' if s['contract']['done']['found'] else 'MISSING'}; the proxy booked {s['proxy_requests']} request, ${s['proxy_cost']:.4f}")

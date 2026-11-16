@@ -1370,7 +1370,7 @@ def demo_tests():
     status = [l.split(" | ")[-2] for l in lines]
     check(status == ["done", "killed: budget $0.02 reached at $0.0210 true", "done", "done"] and [l.split(" | ")[1] for l in lines] == ["demo-done", "demo-budget", "demo-leftover", "demo-home"],
           f"demo 2: the output holds four ledger lines: done, killed at the budget, done, done: {status}")
-    check(led[1:] == lines and led[0].startswith(f"# {siwithin.NAME} ledger") and siwithin.ledger_total(m.group(1)) == (0.035, 4) if m else False, f"demo 3: the demo's ledger holds those four lines and no other, $0.0350 in all: {len(led)} lines")
+    check([siwithin.demo_short(l, os.path.join(os.path.dirname(os.path.dirname(m.group(1))), "work")) for l in led[1:]] == lines and all("<demo>/work" in l and l.endswith("...") for l in lines) and led[0].startswith(f"# {siwithin.NAME} ledger") and siwithin.ledger_total(m.group(1)) == (0.035, 4) if m else False, f"demo 3: the demo's ledger holds those four lines and no other, $0.0350 in all: {len(led)} lines")
     rc2, out2, _ = tool_cli(["--verify", "--home", os.path.dirname(m.group(1))]) if m else (1, "", "")
     check(rc2 == 0, f"demo 4: --verify passes on the demo's ledger and receipts: {out2.strip()[-80:]!r}")
     check("done text 'DEMO-OK': found; the proxy booked 1 request, $0.0070" in out and "booked 3 requests, $0.0210, and answered the next with 402 (proxy.jsonl: refused 1)" in out,
@@ -1390,7 +1390,7 @@ def demo_tests():
         for n in fs:
             with open(os.path.join(d, n), "rb") as f:
                 if TESTKEY.encode() in f.read(): hits.append(n)
-    shape = lambda o: re.sub(r"\d{4}-\d\d-\d\d[ -]\d\d:?\d\d|receipt [0-9a-f]{64}|siwithin-demo-[a-z0-9_]{8}|127\.0\.0\.1:\d+|\d\.\d min", "~", o)
+    shape = lambda o: re.sub(r"\d{4}-\d\d-\d\d[ -]\d\d:?\d\d|receipt [0-9a-f]{12,64}|siwithin-demo-[a-z0-9_]{8}|127\.0\.0\.1:\d+|\d\.\d min", "~", o)
     check(rc == 0 and not err and m3 and not hits and shape(out3) == shape(out), f"demo 10: with ANTHROPIC_API_KEY set the demo prints the same, and the key is in no file the demo or its runs wrote: rc {rc}, hits {hits}")
 
 
