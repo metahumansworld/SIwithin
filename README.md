@@ -1,6 +1,29 @@
 # SIwithin
 
-SIwithin runs an agent CLI unattended on a brief, inside a fence around the folders you give it and under a dollar budget, and tells you afterwards, in one ledger line, whether the run was `done`, `finished, contract unmet`, `killed` at its budget or timer, stopped by the CLI's own flag, or refused before it began, and what it cost by the proxy's count. `done` means the CLI finished and the brief's own test, when you give one (`--done "<text>"` present in the result, `--absent "<text>"` not), passed; a run that stopped is never written as done, and the exit status is 0 only when it was. It keeps three promises with a tool and not with hope:
+**What it is.** SIwithin runs an agent CLI unattended on a brief and writes one ledger line saying whether the run was `done` or only stopped, and what it cost. The run works inside a fence around the folders you give it, and under a dollar budget. macOS (`sandbox-exec`) and Linux (bubblewrap). One Python file, standard library only, no telemetry, Apache-2.0.
+
+```
+export ANTHROPIC_API_KEY=...     # read once, outside the fence; the run gets a per-run token in its place
+mkdir -p ~/.config/siwithin && echo 20 > ~/.config/siwithin/cap     # all runs together may spend $20
+python3 siwithin.py --dir ~/work/proj --model sonnet --dry-run < brief.md      # print everything, run nothing
+python3 siwithin.py --dir ~/work/proj --model sonnet --budget 2 --done "ALL TESTS PASS" < brief.md
+```
+
+**What you get back.** One line per run (the folder and the receipt are shortened here):
+
+```
+2026-10-13 14:02 | docs-pass | ~/work/proj | claude sonnet - | 12 turns | 6.4 min | cli $0.4123 | true $0.4123 | in 310k out 18k | runs/2026-10-13-1402-docs-pass | done | receipt 864410d4...
+```
+
+The status is `done`, `finished, contract unmet`, `killed` at its budget or timer, stopped by the CLI's own flag, or refused before it began. `done` means the CLI finished and the brief's own test, when you give one (`--done "<text>"` present in the result, `--absent "<text>"` not), passed. A run that stopped is never written as done, and the exit status is 0 only when it was.
+
+**Where the key is.** With the Claude adapter the run never holds your API key. It holds a token good for that one run, and every request it makes goes through a loopback proxy that adds the key, prices the response and refuses past the budget. The response that crosses the budget is paid whole, and so is a burst sent before any response is priced (see "The ledger").
+
+**What is not tested or not done.** The Linux fence has run the suite's fake CLIs and the real CLI once, a two-turn brief on one Ubuntu 24.04 VM. The Codex adapter was built from documentation and has not been run against a live CLI; it holds the key in its environment and runs without the network wall. What a run sends to the API inside its own requests is not fenced. Read [SECURITY.md](SECURITY.md) before relying on it.
+
+**Who wrote it.** An AI model wrote the code and its tests, directed and reviewed by the maintainer. Two outside reviews, of 0.6.2 and 0.6.3, were made by a second AI model; what they found is fixed in 0.6.3 and 0.6.4 or listed in SECURITY.md under "Known gaps" ([CHANGELOG](CHANGELOG.md)). No person outside the project has reviewed the code for security yet.
+
+It keeps three promises with a tool and not with hope:
 
 1. **The run touches only the folders it was given.** Your home folder is refused, for reading and writing, and the run's folders are allowed back.
 2. **The run cannot spend more than the dollars it was given.** A budget per run, a cap across all runs, a timer on every run, and, for the Claude adapter, a loopback proxy that is the one door to the API: the run holds a per-run token and not your key, and every request it makes, however it makes it, is metered there and refused past the budget, within the limits "The ledger" states: the response that crosses the budget is paid whole, and so is a burst sent before any response is priced. Where a CLI cannot be stopped mid-run, the tool refuses it unless you say you accept that (see "The ledger" and "The Codex adapter").
